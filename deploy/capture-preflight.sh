@@ -37,9 +37,13 @@ fi
 rm -rf "$TMP"
 
 echo "--- current Postfix settings (read-only) ---"
-postconf -M submission/inet >/dev/null 2>&1 && ok "submission service present: $(postconf -M submission/inet | tr -s ' ' | cut -c1-120)" \
-  || warn "no 'submission' service in master.cf; adapt the proposal to the service BeastPing uses"
-postconf -M cleanup-archive/unix >/dev/null 2>&1 && warn "cleanup-archive already defined" || ok "cleanup-archive not defined yet"
+SUBMISSION=$(postconf -M submission/inet 2>/dev/null)
+if [ -n "$SUBMISSION" ]; then
+  ok "submission service present: $(echo "$SUBMISSION" | tr -s ' ' | cut -c1-120)"
+else
+  warn "no 'submission' service in master.cf; adapt the proposal to the service BeastPing uses"
+fi
+[ -n "$(postconf -M cleanup-archive/unix 2>/dev/null)" ] && warn "cleanup-archive already defined" || ok "cleanup-archive not defined yet"
 postconf -P submission/inet/cleanup_service_name 2>/dev/null | grep -q . \
   && warn "submission already overrides cleanup_service_name: $(postconf -P submission/inet/cleanup_service_name)" \
   || ok "submission uses the default cleanup service"

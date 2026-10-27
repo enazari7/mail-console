@@ -113,3 +113,27 @@ def test_example_env_sources_cleanly():
     out = subprocess.run(["bash", "-c", "set -euo pipefail; set -a; . ./.env.example; set +a; echo \"$MC_MONITOR_UNITS\""],
                          cwd=ROOT, capture_output=True, text=True, check=True).stdout
     assert "beastping-mailguard.service" in out and "postfix@-.service" in out
+
+
+def test_capture_preflight_is_read_only():
+    text = (DEPLOY / "capture-preflight.sh").read_text()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(("#", "echo")))
+    for forbidden in ("postconf -e", "postconf -M ", "postconf -P ", "postconf -X", "postconf -MX", "postconf -PX",
+                      "postfix reload", "postfix restart", "postfix stop", "systemctl", "> /etc", ">/etc"):
+        assert forbidden not in code.replace('postconf -M submission/inet', '').replace(
+            'postconf -M cleanup-archive/unix', '').replace('postconf -P submission/inet/cleanup_service_name', ''), \
+            forbidden
+    assert "postmap -q" in code and "postmap /" not in code
+
+
+def test_no_script_changes_postfix():
+    for path in SCRIPTS:
+        if path.name == "capture-preflight.sh":
+            continue
+        text = path.read_text()
+        assert "postconf" not in text and "postmap" not in text and "master.cf" not in text, path
+
+
+def test_capture_wrapper_uses_isolated_system_python():
+    text = (DEPLOY / "bin" / "mc-capture").read_text()
+    assert "exec /usr/bin/python3 -I /opt/mail-console/current/mailconsole/capture.py" in text

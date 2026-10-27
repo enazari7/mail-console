@@ -122,8 +122,10 @@ def main() -> int:
             check(status == 200 and "Subject:" in raw and "attachment" in headers.get("Content-Disposition", ""),
                   "original .eml downloads")
             status, headers, preview = c.request(f"/archives/{aid}/preview.html")
-            check(status in (200, 404) and headers.get("Content-Security-Policy", "sandbox").startswith("sandbox"),
-                  "HTML preview is sandboxed")
+            if status == 200:
+                check(headers.get("Content-Security-Policy", "").startswith("sandbox"), "HTML preview is sandboxed")
+            else:
+                check(status == 404 and "has no HTML part" in preview, "plain-text message has no HTML preview")
             part = re.search(rf'href="(/archives/{aid}/parts/\d+)"', page)
             if part:
                 status, headers, _ = c.request(part.group(1))

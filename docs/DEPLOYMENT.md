@@ -154,6 +154,20 @@ kept for rollback.
   is a one-shot wrapper that stays "active (exited)" even if the Postfix master
   process stops.
 
+### Upgrading to the MAIL-CONTENT-01 release
+
+* Migration `0003_mail_content` adds the archive tables, an archive search
+  index, the audit log, TOTP columns and per-message archive-copy state, and
+  drops the always-empty `message_content` placeholder.
+* `install.sh`/`update.sh` additionally create the user `mcarchive`,
+  `/var/spool/mail-console/{incoming,quarantine}`, `/var/lib/mail-console/archive`
+  and, only if missing, the encryption key `/etc/mail-console/archive.key`.
+  **Back up the key** separately from the archive.
+* New dependency: `cryptography` (hash-pinned, ARM64 wheel).
+* Nothing is captured until the Postfix change in
+  [MAIL-CAPTURE.md](MAIL-CAPTURE.md) is reviewed and applied; that is a
+  separate, manual step with its own verification and deactivation procedure.
+
 ## Rollback
 
 ```bash
@@ -193,6 +207,8 @@ console never affects Postfix.
 | Reset a password | `sudo mail-console admin reset-password --username admin` (signs out all sessions) |
 | Locked out by throttling | `sudo mail-console admin unlock` |
 | Search index incomplete | `sudo mail-console reindex` |
+| Archive health / integrity | `sudo mail-console archive status`, `sudo mail-console archive verify` |
+| Lost 2FA device | `sudo mail-console admin totp-disable --username admin` |
 | Apply retention now | `sudo mail-console purge` |
 | Database backup | `sudo -u mailconsole sqlite3 /var/lib/mail-console/mail-console.sqlite3 ".backup /var/lib/mail-console/backups/manual.sqlite3"` (or copy while the services are stopped) |
 | Re-ingest from scratch | stop both services, move the database away, `sudo mail-console migrate`, `sudo mail-console import --rotated`, recreate the admin, start |
