@@ -1,0 +1,74 @@
+2026-10-20T08:14:59.001122+00:00 mail systemd[1]: Started session-412.scope - Session 412 of User ubuntu.
+2026-10-20T08:15:01.102345+00:00 mail postfix/submission/smtpd[41012]: connect from app.example.net[198.51.100.20]
+2026-10-20T08:15:01.302114+00:00 mail postfix/submission/smtpd[41012]: Anonymous TLS connection established from app.example.net[198.51.100.20]: TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits) key-exchange X25519 server-signature ECDSA (P-256) server-digest SHA256
+2026-10-20T08:15:01.410772+00:00 mail postfix/submission/smtpd[41012]: 3F2A61C0D3: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-20T08:15:01.498120+00:00 mail postfix/cleanup[41015]: 3F2A61C0D3: message-id=<20261020081501.1a2b3c@example.com>
+2026-10-20T08:15:01.533201+00:00 mail opendkim[812]: 3F2A61C0D3: DKIM-Signature field added (s=mail, d=example.com)
+2026-10-20T08:15:01.540118+00:00 mail postfix/qmgr[1203]: 3F2A61C0D3: from=<notify@example.com>, size=4821, nrcpt=1 (queue active)
+2026-10-20T08:15:01.552000+00:00 mail postfix/submission/smtpd[41012]: disconnect from app.example.net[198.51.100.20] ehlo=2 starttls=1 auth=1 mail=1 rcpt=1 data=1 quit=1 commands=8
+2026-10-20T08:15:02.731514+00:00 mail postfix/smtp[41018]: 3F2A61C0D3: to=<alice@example.org>, relay=mx.example.org[203.0.113.25]:25, delay=1.3, delays=0.13/0.02/0.61/0.54, dsn=2.0.0, status=sent (250 2.0.0 OK  1760948102 a1b2c3d4e5f6-12345abcdef.123 - gsmtp)
+2026-10-20T08:15:02.733881+00:00 mail postfix/qmgr[1203]: 3F2A61C0D3: removed
+2026-10-20T08:17:00.000412+00:00 mail CRON[41050]: (root) CMD (command -v debian-sa1 > /dev/null && debian-sa1 1 1)
+2026-10-20T09:02:09.900001+00:00 mail postfix/submission/smtpd[41100]: connect from app.example.net[198.51.100.20]
+2026-10-20T09:02:10.010000+00:00 mail postfix/submission/smtpd[41100]: 7D1E80B2A4: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-20T09:02:10.090300+00:00 mail postfix/cleanup[41101]: 7D1E80B2A4: message-id=<20261020090210.55aa@example.com>
+2026-10-20T09:02:10.120456+00:00 mail opendkim[812]: 7D1E80B2A4: DKIM-Signature field added (s=mail, d=example.com)
+2026-10-20T09:02:10.130777+00:00 mail postfix/qmgr[1203]: 7D1E80B2A4: from=<bounces@example.com>, size=5120, nrcpt=2 (queue active)
+2026-10-20T09:02:11.031009+00:00 mail postfix/smtp[41105]: 7D1E80B2A4: to=<bob@example.net>, relay=mx1.example.net[203.0.113.40]:25, delay=0.9, delays=0.05/0.01/0.4/0.44, dsn=2.0.0, status=sent (250 ok dirdel)
+2026-10-20T09:02:11.233510+00:00 mail postfix/smtp[41106]: 7D1E80B2A4: to=<nobody@example.org>, relay=mx.example.org[203.0.113.25]:25, delay=1.1, delays=0.05/0.01/0.5/0.54, dsn=5.1.1, status=bounced (host mx.example.org[203.0.113.25] said: 550-5.1.1 The email account that you tried to reach does not exist. Please try 550-5.1.1 double-checking the recipient's email address for typos or 550 5.1.1 unnecessary spaces. - gsmtp (in reply to RCPT TO command))
+2026-10-20T09:02:11.240112+00:00 mail postfix/cleanup[41101]: 9C4F10B2B7: message-id=<20261020090211.9C4F10B2B7@mail.example.com>
+2026-10-20T09:02:11.241001+00:00 mail postfix/bounce[41120]: 7D1E80B2A4: sender non-delivery notification: 9C4F10B2B7
+2026-10-20T09:02:11.250333+00:00 mail postfix/qmgr[1203]: 9C4F10B2B7: from=<>, size=7340, nrcpt=1 (queue active)
+2026-10-20T09:02:11.251020+00:00 mail postfix/qmgr[1203]: 7D1E80B2A4: removed
+2026-10-20T09:02:11.302600+00:00 mail postfix/pipe[41122]: 9C4F10B2B7: to=<bounces@example.com>, relay=bounce-collector, delay=0.06, delays=0.01/0.01/0/0.04, dsn=2.0.0, status=sent (delivered via bounce-collector service)
+2026-10-20T09:02:11.303900+00:00 mail postfix/qmgr[1203]: 9C4F10B2B7: removed
+2026-10-20T10:00:00.100000+00:00 mail postfix/submission/smtpd[41200]: A3B5C7D9E1: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-20T10:00:00.180000+00:00 mail postfix/cleanup[41201]: A3B5C7D9E1: message-id=<20261020100000.77cc@example.com>
+2026-10-20T10:00:00.200000+00:00 mail postfix/qmgr[1203]: A3B5C7D9E1: from=<notify@example.com>, size=3900, nrcpt=1 (queue active)
+2026-10-20T10:00:02.310000+00:00 mail postfix/smtp[41205]: A3B5C7D9E1: to=<carol@example.net>, relay=mta5.example.net[203.0.113.50]:25, delay=2.1, delays=0.02/0.01/1.5/0.57, dsn=4.7.0, status=deferred (host mta5.example.net[203.0.113.50] said: 421 4.7.0 [TSS04] Messages from 192.0.2.10 temporarily deferred due to unexpected volume or user complaints - 4.16.55.1; see https://postmaster.example.net/error-codes (in reply to MAIL FROM command))
+2026-10-20T10:00:05.000000+00:00 mail postfix/smtpd[41210]: warning: hostname client.example.invalid does not resolve to address 203.0.113.99: Name or service not known
+2026-10-20T10:00:05.100000+00:00 mail postfix/smtpd[41210]: NOQUEUE: reject: RCPT from unknown[203.0.113.99]: 554 5.7.1 <victim@example.org>: Relay access denied; from=<spam@example.invalid> to=<victim@example.org> proto=ESMTP helo=<example.invalid>
+2026-10-20T10:01:30.400000+00:00 mail postfix/submission/smtpd[41220]: warning: unknown[203.0.113.77]: SASL LOGIN authentication failed: UGFzc3dvcmQ6
+2026-10-20T10:01:30.500000+00:00 mail dovecot: auth: passwd-file(attacker@example.com,203.0.113.77): Password mismatch (given password: hunter2)
+2026-10-20T10:06:02.400000+00:00 mail postfix/qmgr[1203]: A3B5C7D9E1: from=<notify@example.com>, size=3900, nrcpt=1 (queue active)
+2026-10-20T10:06:32.420000+00:00 mail postfix/smtp[41230]: A3B5C7D9E1: to=<carol@example.net>, relay=none, delay=362, delays=362/0.01/30/0, dsn=4.4.1, status=deferred (connect to mta5.example.net[203.0.113.50]:25: Connection timed out)
+2026-10-20T10:20:00.000000+00:00 mail postfix/submission/smtpd[41300]: F1E2D3C4B5: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-20T10:20:00.090000+00:00 mail postfix/cleanup[41301]: F1E2D3C4B5: milter-reject: END-OF-MESSAGE from app.example.net[198.51.100.20]: 5.7.1 Sender address not authorized for this login; from=<ceo@example.com> to=<dave@example.org> proto=ESMTP helo=<app.example.net>
+2026-10-20T10:26:40.000000+00:00 mail postfix/qmgr[1203]: A3B5C7D9E1: from=<notify@example.com>, size=3900, nrcpt=1 (queue active)
+2026-10-20T10:26:41.120000+00:00 mail postfix/smtp[41310]: A3B5C7D9E1: to=<carol@example.net>, relay=mta5.example.net[203.0.113.50]:25, delay=1601, delays=1600/0.01/0.6/0.5, dsn=2.0.0, status=sent (250 ok dirdel)
+2026-10-20T10:26:41.121000+00:00 mail postfix/qmgr[1203]: A3B5C7D9E1: removed
+2026-10-20T11:00:00.000000+00:00 mail postfix/pickup[1201]: 5A6B7C8D9E: uid=33 from=<www-data>
+2026-10-20T11:00:00.050000+00:00 mail postfix/cleanup[41401]: 5A6B7C8D9E: message-id=<20261020110000.5A6B7C8D9E@mail.example.com>
+2026-10-20T11:00:00.060000+00:00 mail postfix/qmgr[1203]: 5A6B7C8D9E: from=<www-data@mail.example.com>, size=612, nrcpt=1 (queue active)
+2026-10-20T11:00:00.090000+00:00 mail postfix/local[41402]: 5A6B7C8D9E: to=<root@mail.example.com>, orig_to=<root>, relay=local, delay=0.09, delays=0.05/0.01/0/0.03, dsn=2.0.0, status=sent (delivered to mailbox)
+2026-10-20T11:00:00.091000+00:00 mail postfix/qmgr[1203]: 5A6B7C8D9E: removed
+2026-10-20T12:00:00.000000+00:00 mail postfix/submission/smtpd[41500]: 2B4C6D8E0F: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-20T12:00:00.080000+00:00 mail postfix/cleanup[41501]: 2B4C6D8E0F: message-id=<first-use@example.com>
+2026-10-20T12:00:00.090000+00:00 mail postfix/qmgr[1203]: 2B4C6D8E0F: from=<notify@example.com>, size=2000, nrcpt=1 (queue active)
+2026-10-20T12:00:01.000000+00:00 mail postfix/smtp[41505]: 2B4C6D8E0F: to=<erin@example.org>, relay=mx.example.org[203.0.113.25]:25, delay=1, delays=0.09/0/0.5/0.41, dsn=2.0.0, status=sent (250 2.0.0 OK  1760961601 x9y8z7-1.2 - gsmtp)
+2026-10-20T12:00:01.001000+00:00 mail postfix/qmgr[1203]: 2B4C6D8E0F: removed
+2026-10-20T16:30:00.000000+00:00 mail postfix/submission/smtpd[41600]: 2B4C6D8E0F: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-20T16:30:00.080000+00:00 mail postfix/cleanup[41601]: 2B4C6D8E0F: message-id=<second-use@example.com>
+2026-10-20T16:30:00.090000+00:00 mail postfix/qmgr[1203]: 2B4C6D8E0F: from=<notify@example.com>, size=2100, nrcpt=1 (queue active)
+2026-10-20T16:30:01.500000+00:00 mail postfix/smtp[41605]: 2B4C6D8E0F: to=<frank@example.net>, relay=mx1.example.net[203.0.113.40]:25, delay=1.5, delays=0.09/0/0.8/0.61, dsn=5.7.1, status=bounced (host mx1.example.net[203.0.113.40] said: 554 5.7.1 [BL21] Connections not accepted from IP addresses on Spamhaus PBL (in reply to MAIL FROM command))
+2026-10-20T16:30:01.510000+00:00 mail postfix/cleanup[41601]: 6E7F8A9B0C: message-id=<20261020163001.6E7F8A9B0C@mail.example.com>
+2026-10-20T16:30:01.511000+00:00 mail postfix/bounce[41606]: 2B4C6D8E0F: sender non-delivery notification: 6E7F8A9B0C
+2026-10-20T16:30:01.512000+00:00 mail postfix/qmgr[1203]: 2B4C6D8E0F: removed
+2026-10-21T07:00:00.000000+00:00 mail postfix/submission/smtpd[42000]: C0FFEE1234: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-21T07:00:00.100000+00:00 mail postfix/cleanup[42001]: C0FFEE1234: message-id=<20261021070000.dd@example.com>
+2026-10-21T07:00:00.110000+00:00 mail postfix/qmgr[1203]: C0FFEE1234: from=<notify@example.com>, size=3000, nrcpt=1 (queue active)
+2026-10-21T07:00:30.200000+00:00 mail postfix/smtp[42005]: C0FFEE1234: to=<grace@example.invalid>, relay=none, delay=30, delays=0.01/0/30/0, dsn=4.4.1, status=deferred (connect to mx.example.invalid[192.0.2.200]:25: Connection timed out)
+2026-10-23T07:00:00.000000+00:00 mail postfix/qmgr[1203]: C0FFEE1234: from=<notify@example.com>, size=3000, nrcpt=1 (queue active)
+2026-10-23T07:00:30.000000+00:00 mail postfix/smtp[43005]: C0FFEE1234: to=<grace@example.invalid>, relay=none, delay=172830, delays=172800/0/30/0, dsn=4.4.1, status=deferred (connect to mx.example.invalid[192.0.2.200]:25: Connection timed out)
+2026-10-26T07:00:01.000000+00:00 mail postfix/qmgr[1203]: C0FFEE1234: from=<notify@example.com>, status=expired, returned to sender
+2026-10-26T07:00:01.010000+00:00 mail postfix/cleanup[44001]: 1D2E3F4A5B: message-id=<20261026070001.1D2E3F4A5B@mail.example.com>
+2026-10-26T07:00:01.011000+00:00 mail postfix/bounce[44002]: C0FFEE1234: sender non-delivery notification: 1D2E3F4A5B
+2026-10-26T07:00:01.012000+00:00 mail postfix/qmgr[1203]: C0FFEE1234: removed
+2026-10-26T09:00:00.000000+00:00 mail postfix/submission/smtpd[44100]: 4Xyz9Lmn7Qz3wJ: client=app.example.net[198.51.100.20], sasl_method=PLAIN, sasl_username=notify@example.com
+2026-10-26T09:00:00.050000+00:00 mail postfix/cleanup[44101]: 4Xyz9Lmn7Qz3wJ: message-id=<long-id@example.com>
+2026-10-26T09:00:00.060000+00:00 mail postfix/qmgr[1203]: 4Xyz9Lmn7Qz3wJ: from=<notify@example.com>, size=1800, nrcpt=3 (queue active)
+2026-10-26T09:00:01.000000+00:00 mail postfix/smtp[44105]: 4Xyz9Lmn7Qz3wJ: to=<heidi@example.org>, relay=mx.example.org[203.0.113.25]:25, delay=0.94, delays=0.06/0/0.5/0.38, dsn=2.0.0, status=sent (250 2.0.0 OK  1761469201 q1-2 - gsmtp)
+2026-10-26T09:00:01.100000+00:00 mail postfix/smtp[44106]: 4Xyz9Lmn7Qz3wJ: to=<ivan@example.net>, relay=mx1.example.net[203.0.113.40]:25, delay=1, delays=0.06/0/0.5/0.44, dsn=4.2.1, status=deferred (host mx1.example.net[203.0.113.40] said: 421 4.2.1 Mailbox temporarily unavailable (in reply to RCPT TO command))
+2026-10-26T09:00:01.200000+00:00 mail postfix/smtp[44107]: 4Xyz9Lmn7Qz3wJ: to=<judy@example.com>, relay=mx.example.com[203.0.113.60]:25, delay=1.1, delays=0.06/0/0.6/0.44, dsn=5.2.2, status=bounced (host mx.example.com[203.0.113.60] said: 552 5.2.2 Mailbox full (in reply to RCPT TO command))
+2026-10-26T09:00:02.000000+00:00 mail postfix/postfix-script[44200]: warning: symlink leaves directory: /etc/postfix/./makedefs.out
+2026-10-26T09:00:03.000000+00:00 mail postfix/qmgr[1203]: warning: private/smtp socket: malformed response

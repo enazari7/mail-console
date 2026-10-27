@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, addr, qid, pager %}
+{% block title %}Emails{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><h1>Emails</h1><p class="muted">One row per recipient. Search by sender, recipient, Queue ID or Message-ID.</p></div>
+  <div>{% if refresh %}<a class="btn" href="{{ page_url(data.page) }}">Stop auto-refresh</a>{% else %}<a class="btn" href="{{ refresh_url }}">Auto-refresh</a>{% endif %}</div>
+</header>
+<form method="get" action="/emails" class="filters card">
+  <label class="grow">Search<input type="search" name="q" value="{{ flt.q }}" placeholder="user@example.com, 3F2A61C0D3, <message-id>" maxlength="320"></label>
+  <label>Status<select name="status">
+    <option value="">Any</option>
+    {% for st in FILTER_STATUSES %}<option value="{{ st }}"{% if flt.status == st %} selected{% endif %}>{{ "Failed (bounced, expired, rejected)" if st == "failed" else STATUS_LABELS[st] }}</option>{% endfor %}
+  </select></label>
+  <label>Domain<input name="domain" value="{{ flt.domain }}" placeholder="example.org" maxlength="255"></label>
+  <label>Range<select name="range">
+    {% for key, label in [("all", "All time"), ("1h", "Last hour"), ("24h", "Last 24 hours"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("custom", "Custom")] %}
+    <option value="{{ key }}"{% if rng.key == key %} selected{% endif %}>{{ label }}</option>{% endfor %}
+  </select></label>
+  <label>From<input type="datetime-local" name="start" value="{{ start if rng.key == 'custom' else '' }}"></label>
+  <label>To<input type="datetime-local" name="end" value="{{ end if rng.key == 'custom' else '' }}"></label>
+  <div class="filter-actions"><button class="btn primary" type="submit">Apply</button><a class="btn" href="/emails">Reset</a></div>
+</form>
+
+<section class="card flush">
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Date</th><th>Sender</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Domain</th><th>SMTP response</th><th>Queue ID</th></tr></thead>
+    <tbody>
+    {% for r in data.rows %}
+      {% set st = r.recipient_status or r.message_status %}
+      <tr>
+        <td class="nowrap"><a href="/emails/{{ r.id }}">{{ display.ts(r.first_ts) }}</a></td>
+        <td class="addr" title="{{ r.sender or '' }}">{{ addr(r.sender) }}</td>
+        <td class="addr" title="{{ r.address or '' }}">{% if r.address is not none %}{{ r.address }}{% else %}<span class="unknown" title="No recipient appears in the available log lines yet">{% if r.nrcpt %}{{ r.nrcpt }} pending{% else %}unknown{% endif %}</span>{% endif %}</td>
+        <td class="subject">{% if r.subject %}{{ r.subject }}{% else %}<span class="muted" title="Postfix does not log subjects unless header_checks INFO is configured">—</span>{% endif %}</td>
+        <td>{{ pill(st) }}</td>
+        <td>{{ r.domain or "—" }}</td>
+        <td class="resp" title="{{ r.response or r.last_response or '' }}">{% if r.dsn %}<span class="mono">{{ r.dsn }}</span> {% endif %}{{ (r.response if r.address is not none else r.last_response)|summarize(70) }}</td>
+        <td>{{ qid(r.queue_id, r.id) }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="8" class="empty">No emails match these filters.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {{ pager(data, page_url) }}
+</section>
+{% endblock %}

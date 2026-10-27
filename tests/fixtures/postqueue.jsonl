@@ -1,0 +1,2 @@
+{"queue_name": "deferred", "queue_id": "4Xyz9Lmn7Qz3wJ", "arrival_time": 1761469200, "message_size": 1800, "forced_expire": false, "sender": "notify@example.com", "recipients": [{"address": "ivan@example.net", "delay_reason": "host mx1.example.net[203.0.113.40] said: 421 4.2.1 Mailbox temporarily unavailable"}]}
+{"queue_name": "active", "queue_id": "ABCDEF9999", "arrival_time": 1761470000, "message_size": 900, "forced_expire": false, "sender": "", "recipients": [{"address": "x@example.org"}]}

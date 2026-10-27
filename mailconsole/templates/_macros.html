@@ -1,0 +1,33 @@
+{% macro pill(status) -%}
+<span class="pill st-{{ status or 'unknown' }}" title="{{ STATUS_HELP.get(status or 'unknown', '') }}"><i aria-hidden="true"></i>{{ STATUS_LABELS.get(status or 'unknown', status) }}</span>
+{%- endmacro %}
+
+{% macro addr(value) -%}
+{%- if value is none -%}<span class="unknown" title="Not present in the available logs">unknown</span>
+{%- elif value == "" -%}<span class="muted" title="Null sender: Postfix-generated notification">&lt;&gt;</span>
+{%- else -%}{{ value }}{%- endif -%}
+{%- endmacro %}
+
+{% macro qid(value, id=None) -%}
+{%- if value -%}{% if id %}<a class="mono" href="/emails/{{ id }}">{{ value }}</a>{% else %}<span class="mono">{{ value }}</span>{% endif %}
+{%- else -%}<span class="muted" title="Rejected before a queue file was created">NOQUEUE</span>{%- endif -%}
+{%- endmacro %}
+
+{% macro pager(data, page_url) -%}
+<nav class="pager" aria-label="Pagination">
+  <span class="muted small">{% if data.total %}{{ (data.page - 1) * data.per_page + 1 }}–{{ [data.page * data.per_page, data.total]|min }} of {{ data.total }}{% else %}0 results{% endif %}</span>
+  <span class="pager-links">
+  {% if data.page > 1 %}<a class="btn" href="{{ page_url(1) }}">First</a><a class="btn" href="{{ page_url(data.page - 1) }}">Previous</a>{% endif %}
+  <span class="small">Page {{ data.page }} / {{ data.pages }}</span>
+  {% if data.page < data.pages %}<a class="btn" href="{{ page_url(data.page + 1) }}">Next</a><a class="btn" href="{{ page_url(data.pages) }}">Last</a>{% endif %}
+  </span>
+</nav>
+{%- endmacro %}
+
+{% macro legend() -%}
+<div class="legend" aria-hidden="false">
+  <span><i class="sw s-accepted"></i>Accepted</span>
+  <span><i class="sw s-deferred"></i>Deferred</span>
+  <span><i class="sw s-failed"></i>Failed (bounced, expired, rejected)</span>
+</div>
+{%- endmacro %}

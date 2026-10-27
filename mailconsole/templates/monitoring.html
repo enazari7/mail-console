@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% from "_macros.html" import qid %}
+{% block title %}Monitoring{% endblock %}
+{% block content %}
+<header class="page-head">
+  <div><h1>Monitoring</h1><p class="muted">Read-only. Collected by the collector every few seconds with <code>systemctl show</code> and <code>postqueue -j</code>; nothing here can start, stop or flush anything.</p></div>
+</header>
+
+<section class="card">
+  <div class="card-head"><h2>Services</h2>{% if m.stale_services %}<span class="pill st-deferred"><i></i>stale</span>{% endif %}</div>
+  <div class="services">
+  {% for s in m.services %}
+    <div class="service {{ 'ok' if s.ok else 'bad' }}">
+      <div class="svc-head"><span class="dot" aria-hidden="true"></span><strong>{{ s.label }}</strong><span class="svc-state">{{ "Running" if s.ok else (s.active_state or "unknown")|capitalize }}</span></div>
+      <div class="small muted mono">{{ s.unit }}</div>
+      <div class="small">{% if s.sub_state %}{{ s.active_state }} ({{ s.sub_state }}){% endif %}{% if s.main_pid %} · PID {{ s.main_pid }}{% endif %}{% if s.restarts %} · {{ s.restarts }} restarts{% endif %}</div>
+      {% if s.since %}<div class="small muted">since {{ s.since }}</div>{% endif %}
+      {% if s.error %}<div class="small bad-text">{{ s.error }}</div>{% endif %}
+      <div class="small muted">checked {{ ago(s.checked_ts) }}</div>
+    </div>
+  {% else %}
+    <p class="muted">No service checks recorded yet. They appear once the collector is running.</p>
+  {% endfor %}
+  </div>
+</section>
+
+<div class="grid-2">
+  <section class="card">
+    <h2>Postfix queue</h2>
+    {% set q = m.queue %}
+    {% if not q %}<p class="muted">No queue snapshot yet.</p>
+    {% elif not q.ok %}<div class="banner error">Queue status unavailable: {{ q.error }}</div><p class="muted small">Checked {{ ago(q.ts) }}.</p>
+    {% else %}
+      <p><span class="tile-value">{{ q.total }}</span> message(s) · snapshot {{ ago(q.ts) }}</p>
+      <p class="small">{% for name, n in q.by_queue.items() %}<span class="chip">{{ name }}: {{ n }}</span>{% else %}<span class="muted">Queue is empty.</span>{% endfor %}</p>
+      {% if q.oldest_arrival_ts %}<p class="small">Oldest message arrived {{ display.ts(q.oldest_arrival_ts) }} ({{ ago(q.oldest_arrival_ts) }}).</p>{% endif %}
+    {% endif %}
+    {{ queue_chart }}
+  </section>
+  <section class="card">
+    <h2>Collector</h2>
+    {% set c = m.collector %}
+    <dl class="meta">
+      <dt>Status</dt><dd>{% if c.alive %}<span class="pill st-accepted"><i></i>Running</span>{% else %}<span class="pill st-bounced"><i></i>Not reporting</span>{% endif %}</dd>
+      <dt>Heartbeat</dt><dd>{{ ago(c.heartbeat_ts) }}</dd>
+      <dt>Source</dt><dd class="mono">{{ c.source or "—" }}</dd>
+      <dt>Newest log line</dt><dd>{{ display.ts(c.last_log_ts) }}{% if c.last_log_ts %} ({{ ago(c.last_log_ts) }}){% endif %}</dd>
+      <dt>Lines read</dt><dd>{{ "{:,}".format(c.lines_total) }}</dd>
+      <dt>Events stored</dt><dd>{{ "{:,}".format(c.events_total) }} (duplicates ignored: {{ "{:,}".format(c.duplicates_total) }})</dd>
+      {% for cp in c.checkpoints %}<dt>Checkpoint</dt><dd class="mono small">{{ cp.source }} @ {{ cp.offset if cp.cursor is none else "cursor" }} · {{ ago(cp.updated_ts) }}</dd>{% endfor %}
+      <dt>Maintenance</dt><dd>{{ ago(c.last_maintenance_ts) }}</dd>
+      <dt>Database</dt><dd>{{ m.db.size|human_bytes }} · {{ "{:,}".format(m.db.messages) }} messages{% if m.db.oldest_ts %} since {{ display.ts(m.db.oldest_ts, "%Y-%m-%d") }}{% endif %}</dd>
+    </dl>
+  </section>
+</div>
+
+{% if m.queue and m.queue.ok and m.queue.entries %}
+<section class="card flush">
+  <div class="card-head pad"><h2>Queued messages</h2><span class="muted small">oldest first, up to 200</span></div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Queue ID</th><th>Queue</th><th>Arrived</th><th>Sender</th><th>Recipients and reason</th></tr></thead>
+    <tbody>
+    {% for e in m.queue.entries %}
+      <tr><td><a class="mono" href="/queue/{{ e.queue_id|urlencode }}">{{ e.queue_id }}</a></td><td>{{ e.queue }}</td><td class="nowrap">{{ display.ts(e.arrival_ts) }}</td><td class="addr">{{ e.sender or "<>" }}</td>
+      <td class="small">{% for r in e.recipients %}<div><span class="addr">{{ r.address }}</span>{% if r.reason %} — <span class="muted">{{ r.reason }}</span>{% endif %}</div>{% endfor %}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endif %}
+
+<section class="card flush">
+  <div class="card-head pad"><h2>Recent operational errors</h2>
+    <nav class="seg small" aria-label="Level">
+      {% for key, label in [("", "All"), ("error", "Errors"), ("warning", "Warnings"), ("fatal", "Fatal"), ("auth", "Auth"), ("info", "Info")] %}<a href="/monitoring{{ '?level=' ~ key if key }}" class="{{ 'active' if level == key }}">{{ label }}</a>{% endfor %}
+    </nav>
+  </div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Time</th><th>Level</th><th>Program</th><th>Message</th></tr></thead>
+    <tbody>
+    {% for o in m.ops %}
+      <tr><td class="nowrap">{{ display.ts(o.ts) }}</td><td><span class="lvl lvl-{{ o.level }}">{{ o.level }}</span></td><td class="mono small">{{ o.program }}{% if o.pid %}[{{ o.pid }}]{% endif %}</td><td class="wrap small">{{ o.message }}</td></tr>
+    {% else %}
+      <tr><td colspan="4" class="empty">Nothing recorded.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}

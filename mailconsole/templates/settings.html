@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<header class="page-head"><div><h1>Settings</h1></div></header>
+{% if saved %}<div class="banner ok" role="status">{{ {"password": "Password changed. Other sessions were signed out.", "display": "Display preferences saved.", "retention": "Retention saved. It is applied by the collector's hourly maintenance.", "sessions": "Other sessions signed out."}.get(saved, "Saved.") }}</div>{% endif %}
+{% if error %}<div class="banner error" role="alert">{{ error }}</div>{% endif %}
+
+<div class="grid-2">
+  <section class="card">
+    <h2>Administrator</h2>
+    <dl class="meta">
+      <dt>Username</dt><dd>{{ admin.username }}</dd>
+      <dt>Created</dt><dd>{{ display.ts(admin.created_ts) }}</dd>
+      <dt>Password changed</dt><dd>{{ display.ts(admin.password_changed_ts) }}</dd>
+      <dt>Last sign-in</dt><dd>{{ display.ts(admin.last_login_ts) }}</dd>
+      <dt>Session policy</dt><dd>expires after {{ idle_minutes }} min idle, {{ max_hours }} h maximum</dd>
+    </dl>
+    <h3>Change password</h3>
+    <form method="post" action="/settings/password" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <input type="text" name="username" value="{{ admin.username }}" autocomplete="username" hidden>
+      <label>Current password<input type="password" name="current_password" autocomplete="current-password" required maxlength="1024"></label>
+      <label>New password <span class="muted small">(12+ characters)</span><input type="password" name="new_password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+      <label>Confirm new password<input type="password" name="confirm_password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
+      <button class="btn primary" type="submit">Change password</button>
+    </form>
+  </section>
+  <section class="card">
+    <h2>Display</h2>
+    <form method="post" action="/settings/display" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <label>Time zone<select name="timezone">{% for tz in timezones %}<option{% if tz == display.tz_name %} selected{% endif %}>{{ tz }}</option>{% endfor %}</select></label>
+      <label>Rows per page<select name="page_size">{% for n in page_sizes %}<option{% if n == display.page_size %} selected{% endif %}>{{ n }}</option>{% endfor %}</select></label>
+      <label>Theme<select name="theme">{% for t in themes %}<option value="{{ t }}"{% if t == display.theme %} selected{% endif %}>{{ t|capitalize }}</option>{% endfor %}</select></label>
+      <button class="btn primary" type="submit">Save display preferences</button>
+    </form>
+    <h3>Data retention</h3>
+    <form method="post" action="/settings/retention" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+      <label>Keep email history for (days)<input type="number" name="retention_days" min="7" max="3650" value="{{ retention_days }}" required></label>
+      <p class="muted small">Messages whose last event is older than this are deleted hourly. Independently, the database is capped at {{ max_db_mb }} MB (MC_MAX_DB_MB); when the cap is reached the oldest history is removed first. Queue snapshots are kept for at most 14 days.</p>
+      <button class="btn primary" type="submit">Save retention</button>
+    </form>
+  </section>
+</div>
+
+<section class="card flush">
+  <div class="card-head pad"><h2>Active sessions</h2>
+    <form method="post" action="/settings/sessions/revoke"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="btn" type="submit">Sign out other sessions</button></form>
+  </div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Started</th><th>Last active</th><th>Expires</th><th>Client</th><th>Browser</th></tr></thead>
+    <tbody>{% for s in sessions %}<tr><td>{{ display.ts(s.created_ts) }}{% if s.token_hash == session.token_hash %} <span class="chip">this session</span>{% endif %}</td><td>{{ ago(s.last_seen_ts) }}</td><td>{{ display.ts(s.expires_ts) }}</td><td class="mono small">{{ s.client_ip or "—" }}</td><td class="small wrap">{{ s.user_agent or "—" }}</td></tr>{% endfor %}</tbody>
+  </table></div>
+</section>
+{% endblock %}

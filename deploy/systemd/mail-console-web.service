@@ -1,0 +1,51 @@
+[Unit]
+Description=BeastPing Mail Console - web interface (loopback only)
+Documentation=https://github.com/enazari7/mail-console
+After=network.target
+
+[Service]
+Type=simple
+User=mailconsole
+Group=mailconsole
+EnvironmentFile=/etc/mail-console/mail-console.env
+Environment=PYTHONPATH=/opt/mail-console/current PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/mail-console/current
+ExecStart=/opt/mail-console/current/venv/bin/python -m mailconsole serve
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# Resource limits: the console must never compete with mail delivery.
+MemoryMax=384M
+TasksMax=64
+CPUWeight=50
+Nice=5
+
+# Sandbox
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mail-console
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target
