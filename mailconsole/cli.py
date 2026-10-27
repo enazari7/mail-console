@@ -134,6 +134,17 @@ def cmd_purge(cfg, args) -> int:
     return 0
 
 
+def cmd_reindex(cfg, args) -> int:
+    from . import search
+    from .collector import require_schema
+    from .db import connect
+    conn = connect(cfg.db_path)
+    require_schema(conn)
+    print(f"rebuilt {search.rebuild(conn):,} search documents")
+    conn.close()
+    return 0
+
+
 def cmd_parse_check(cfg, args) -> int:
     """Dry run: parse a log file and summarise what would be ingested. Writes nothing."""
     from .parser import classify, parse_syslog_line
@@ -191,6 +202,11 @@ def cmd_check(cfg, args) -> int:
         conn = connect(cfg.db_path)
         pending = pending_migrations(conn)
         report(not pending, "database schema up to date" if not pending else f"pending migrations: {pending}")
+        if not pending:
+            from . import search
+            missing = search.missing_documents(conn)
+            report(missing == 0, "search index complete" if not missing
+                   else f"search index missing {missing} message(s); run 'mail-console reindex'")
         conn.close()
         mode = os.stat(cfg.db_path).st_mode & 0o777
         report(mode & 0o077 == 0, f"database file mode {mode:o}")
@@ -229,6 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     d = admin_sub.add_parser("delete")
     d.add_argument("--username", required=True)
     sub.add_parser("purge", help="apply retention now")
+    sub.add_parser("reindex", help="rebuild the full-text search index")
     pc = sub.add_parser("parse-check", help="dry-run parse of a log file (writes nothing)")
     pc.add_argument("file")
     sub.add_parser("check", help="check configuration and access (changes nothing)")
@@ -237,7 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 COMMANDS = {
     "serve": cmd_serve, "collect": cmd_collect, "migrate": cmd_migrate, "import": cmd_import,
-    "admin": cmd_admin, "purge": cmd_purge, "parse-check": cmd_parse_check, "check": cmd_check,
+    "admin": cmd_admin, "purge": cmd_purge, "reindex": cmd_reindex, "parse-check": cmd_parse_check,
+    "check": cmd_check,
 }
 
 

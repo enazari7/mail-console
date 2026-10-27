@@ -1,48 +1,173 @@
 {% extends "base.html" %}
-{% from "_macros.html" import pill, addr, qid, pager %}
+{% from "_macros.html" import badge, mail_icon, icon %}
 {% block title %}Emails{% endblock %}
 {% block content %}
-<header class="page-head">
-  <div><h1>Emails</h1><p class="muted">One row per recipient. Search by sender, recipient, Queue ID or Message-ID.</p></div>
-  <div>{% if refresh %}<a class="btn" href="{{ page_url(data.page) }}">Stop auto-refresh</a>{% else %}<a class="btn" href="{{ refresh_url }}">Auto-refresh</a>{% endif %}</div>
+<header class="page-head emails-head">
+  <h1>Emails</h1>
 </header>
-<form method="get" action="/emails" class="filters card">
-  <label class="grow">Search<input type="search" name="q" value="{{ flt.q }}" placeholder="user@example.com, 3F2A61C0D3, <message-id>" maxlength="320"></label>
-  <label>Status<select name="status">
-    <option value="">Any</option>
-    {% for st in FILTER_STATUSES %}<option value="{{ st }}"{% if flt.status == st %} selected{% endif %}>{{ "Failed (bounced, expired, rejected)" if st == "failed" else STATUS_LABELS[st] }}</option>{% endfor %}
-  </select></label>
-  <label>Domain<input name="domain" value="{{ flt.domain }}" placeholder="example.org" maxlength="255"></label>
-  <label>Range<select name="range">
-    {% for key, label in [("all", "All time"), ("1h", "Last hour"), ("24h", "Last 24 hours"), ("7d", "Last 7 days"), ("30d", "Last 30 days"), ("90d", "Last 90 days"), ("custom", "Custom")] %}
-    <option value="{{ key }}"{% if rng.key == key %} selected{% endif %}>{{ label }}</option>{% endfor %}
-  </select></label>
-  <label>From<input type="datetime-local" name="start" value="{{ start if rng.key == 'custom' else '' }}"></label>
-  <label>To<input type="datetime-local" name="end" value="{{ end if rng.key == 'custom' else '' }}"></label>
-  <div class="filter-actions"><button class="btn primary" type="submit">Apply</button><a class="btn" href="/emails">Reset</a></div>
+
+<div class="tabs-row">
+  <nav class="tabs" aria-label="Mail direction">
+    <a class="tab active" href="{{ url() }}" aria-current="page">Sending</a>
+    <span class="tab disabled" title="Inbound mail tracking is not implemented; only mail handled for delivery by Postfix is shown." aria-disabled="true">Receiving <span class="tab-note">not tracked</span></span>
+  </nav>
+  <div class="tab-actions">
+    <details class="dd help-dd" data-dd>
+      <summary class="icon-btn" title="What do the statuses mean?" aria-label="Status definitions">{{ icon("help") }}</summary>
+      <div class="dd-menu right wide" role="dialog" aria-label="Status definitions">
+        <p class="dd-title">Status definitions</p>
+        <dl class="status-help">
+          {% for st in ["accepted", "deferred", "bounced", "rejected", "expired", "partial", "queued", "processing", "unknown"] %}
+          <dt>{{ badge(st) }}</dt><dd>{{ STATUS_HELP[st] }}</dd>
+          {% endfor %}
+        </dl>
+      </div>
+    </details>
+    {% if refresh %}
+    <a class="icon-btn active" href="{{ url() }}" title="Auto-refresh is on (every 30 s). Click to stop." aria-label="Stop auto-refresh">{{ icon("refresh") }}</a>
+    {% else %}
+    <a class="icon-btn" href="{{ url(refresh=1) }}" title="Auto-refresh every 30 s" aria-label="Start auto-refresh">{{ icon("refresh") }}</a>
+    {% endif %}
+  </div>
+</div>
+
+{# The custom-range inputs live inside a dropdown but submit this separate form. #}
+<form id="custom-range" method="get" action="/emails" hidden>
+  {% for k, v in state.items() if k not in ("range", "start", "end") %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <input type="hidden" name="range" value="custom">
 </form>
 
-<section class="card flush">
-  <div class="table-wrap"><table class="data">
-    <thead><tr><th>Date</th><th>Sender</th><th>Recipient</th><th>Subject</th><th>Status</th><th>Domain</th><th>SMTP response</th><th>Queue ID</th></tr></thead>
+<form class="toolbar" method="get" action="/emails" role="search" data-search-form>
+  {% for k, v in state.items() if k != "q" %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <label class="search-box">
+    {{ icon("search") }}
+    <span class="sr-only">Search</span>
+    <input type="search" name="q" value="{{ flt.q }}" placeholder="Search recipient, sender, Queue ID, Message-ID, domain or error…" maxlength="320" autocomplete="off" spellcheck="false" data-search{% if flt.q %} data-refocus{% endif %}>
+    <button class="sr-only" type="submit">Search</button>
+  </label>
+
+  <details class="dd" data-dd>
+    <summary class="dd-btn"><span>{{ display.range_label(rng) }}</span>{{ icon("chevron") }}</summary>
+    <div class="dd-menu" role="menu">
+      {% for key, label in ranges %}
+      <a role="menuitemradio" aria-checked="{{ 'true' if rng.key == key else 'false' }}" class="dd-item{{ ' checked' if rng.key == key }}" href="{{ url(range=key if key != '15d' else '', start='', end='') }}">{{ icon("check") }}<span>{{ label }}</span></a>
+      {% endfor %}
+      <div class="dd-sep"></div>
+      <div class="dd-custom">
+        <span class="dd-title">Custom range ({{ display.tz_name }})</span>
+        <label>From<input type="datetime-local" name="start" form="custom-range" value="{{ display.local_input(rng.start) }}" required></label>
+        <label>To<input type="datetime-local" name="end" form="custom-range" value="{{ display.local_input(rng.end) }}" required></label>
+        <button class="btn primary small" type="submit" form="custom-range">Apply range</button>
+      </div>
+    </div>
+  </details>
+
+  <details class="dd" data-dd>
+    <summary class="dd-btn"><span>{{ "All statuses" if not flt.status else ("Failed (any)" if flt.status == "failed" else STATUS_LABELS[flt.status]) }}</span>{{ icon("chevron") }}</summary>
+    <div class="dd-menu" role="menu">
+      <a role="menuitemradio" aria-checked="{{ 'true' if not flt.status else 'false' }}" class="dd-item{{ ' checked' if not flt.status }}" href="{{ url(status='') }}">{{ icon("check") }}<span>All statuses</span></a>
+      <div class="dd-sep"></div>
+      {% for st in FILTER_STATUSES %}
+      <a role="menuitemradio" aria-checked="{{ 'true' if flt.status == st else 'false' }}" class="dd-item{{ ' checked' if flt.status == st }}" href="{{ url(status=st) }}" title="{{ STATUS_HELP.get(st, 'Bounced, expired or rejected') }}">{{ icon("check") }}<span class="dot-label"><i class="sdot st-{{ 'bounced' if st == 'failed' else st }}"></i>{{ "Failed (any)" if st == "failed" else STATUS_LABELS[st] }}</span></a>
+      {% endfor %}
+    </div>
+  </details>
+
+  <details class="dd" data-dd>
+    <summary class="dd-btn"><span>{% if flt.sender is none %}All senders{% elif flt.sender == "" %}&lt;&gt; null sender{% else %}{{ flt.sender }}{% endif %}</span>{{ icon("chevron") }}</summary>
+    <div class="dd-menu scroll" role="menu">
+      <a role="menuitemradio" aria-checked="{{ 'true' if flt.sender is none else 'false' }}" class="dd-item{{ ' checked' if flt.sender is none }}" href="{{ url(sender='') }}">{{ icon("check") }}<span>All senders</span></a>
+      <div class="dd-sep"></div>
+      {% for o in sender_options %}
+      <a role="menuitemradio" aria-checked="{{ 'true' if flt.sender == o.sender else 'false' }}" class="dd-item{{ ' checked' if flt.sender == o.sender }}" href="{{ url(sender=o.sender if o.sender else '<>') }}">{{ icon("check") }}<span class="dd-sender">{{ o.sender if o.sender else "<> null sender (notifications)" }}</span>{% if o.n %}<span class="dd-count">{{ "{:,}".format(o.n) }}</span>{% endif %}</a>
+      {% else %}
+      <span class="dd-empty">No senders in this time range.</span>
+      {% endfor %}
+    </div>
+  </details>
+
+  <a class="icon-btn" href="{{ url('/emails/export.csv') }}" title="Export the filtered results as CSV (up to {{ '{:,}'.format(export_limit) }} rows)" aria-label="Export CSV" download>{{ icon("download") }}</a>
+</form>
+
+{% if flt.domain or flt.status or flt.sender is not none or flt.q or rng.key != "15d" %}
+<div class="active-filters">
+  {% if flt.q %}<a class="chip x" href="{{ url(q='') }}" title="Remove">Search: “{{ flt.q }}”{{ icon("x") }}</a>{% endif %}
+  {% if flt.status %}<a class="chip x" href="{{ url(status='') }}" title="Remove">Status: {{ "Failed (any)" if flt.status == "failed" else STATUS_LABELS[flt.status] }}{{ icon("x") }}</a>{% endif %}
+  {% if flt.sender is not none %}<a class="chip x" href="{{ url(sender='') }}" title="Remove">Sender: {{ flt.sender or "<>" }}{{ icon("x") }}</a>{% endif %}
+  {% if flt.domain %}<a class="chip x" href="{{ url(domain='') }}" title="Remove">Domain: {{ flt.domain }}{{ icon("x") }}</a>{% endif %}
+  {% if rng.key != "15d" %}<a class="chip x" href="{{ url(range='', start='', end='') }}" title="Back to last 15 days">Range: {{ display.range_label(rng) }}{{ icon("x") }}</a>{% endif %}
+  <a class="clear-all" href="/emails">Clear all</a>
+</div>
+{% endif %}
+{% if flt.short_term %}<p class="hint">Searches shorter than 3 characters match only an exact Queue ID, recipient address or domain.</p>{% endif %}
+
+{% set arrow = icon("arrow-down") if flt.direction == "desc" else icon("arrow-up") %}
+<div class="tbl" data-table>
+  <table class="emails">
+    <thead>
+      <tr>
+        <th class="col-to" aria-sort="{{ ('descending' if flt.direction == 'desc' else 'ascending') if flt.sort == 'recipient' else 'none' }}"><a href="{{ sort_url('recipient') }}">To{% if flt.sort == "recipient" %}{{ arrow }}{% endif %}</a></th>
+        <th class="col-status" aria-sort="{{ ('descending' if flt.direction == 'desc' else 'ascending') if flt.sort == 'status' else 'none' }}"><a href="{{ sort_url('status') }}">Status{% if flt.sort == "status" %}{{ arrow }}{% endif %}</a></th>
+        <th class="col-subject">Subject</th>
+        <th class="col-sent" aria-sort="{{ ('descending' if flt.direction == 'desc' else 'ascending') if flt.sort == 'sent' else 'none' }}"><a href="{{ sort_url('sent') }}">Sent{% if flt.sort == "sent" %}{{ arrow }}{% endif %}</a></th>
+        <th class="col-act"><span class="sr-only">Actions</span></th>
+      </tr>
+    </thead>
     <tbody>
     {% for r in data.rows %}
-      {% set st = r.recipient_status or r.message_status %}
-      <tr>
-        <td class="nowrap"><a href="/emails/{{ r.id }}">{{ display.ts(r.first_ts) }}</a></td>
-        <td class="addr" title="{{ r.sender or '' }}">{{ addr(r.sender) }}</td>
-        <td class="addr" title="{{ r.address or '' }}">{% if r.address is not none %}{{ r.address }}{% else %}<span class="unknown" title="No recipient appears in the available log lines yet">{% if r.nrcpt %}{{ r.nrcpt }} pending{% else %}unknown{% endif %}</span>{% endif %}</td>
-        <td class="subject">{% if r.subject %}{{ r.subject }}{% else %}<span class="muted" title="Postfix does not log subjects unless header_checks INFO is configured">—</span>{% endif %}</td>
-        <td>{{ pill(st) }}</td>
-        <td>{{ r.domain or "—" }}</td>
-        <td class="resp" title="{{ r.response or r.last_response or '' }}">{% if r.dsn %}<span class="mono">{{ r.dsn }}</span> {% endif %}{{ (r.response if r.address is not none else r.last_response)|summarize(70) }}</td>
-        <td>{{ qid(r.queue_id, r.id) }}</td>
+      {% set st = r.row_status %}
+      <tr data-href="/emails/{{ r.id }}">
+        <td class="col-to">
+          <div class="to-cell">
+            {{ mail_icon(st) }}
+            <div class="to-text">
+              <a class="to-link" href="/emails/{{ r.id }}">{% if r.address is not none %}{{ r.address }}{% elif r.nrcpt %}{{ r.nrcpt }} recipient{{ "s" if r.nrcpt != 1 }} pending{% else %}Unknown recipient{% endif %}</a>
+              <span class="to-sub">{% if r.sender is none %}sender unknown{% elif r.sender == "" %}from &lt;&gt;{% else %}from {{ r.sender }}{% endif %}</span>
+            </div>
+          </div>
+        </td>
+        <td class="col-status">{{ badge(st) }}</td>
+        <td class="col-subject">{% if r.subject %}<span class="subject" dir="auto">{{ r.subject }}</span>{% else %}<span class="na" title="Postfix does not log subjects unless a header_checks INFO rule is configured, and message content is not retained.">Not recorded</span>{% endif %}</td>
+        <td class="col-sent"><time datetime="{{ display.iso(r.first_ts) }}" title="{{ display.ts(r.first_ts) }} {{ display.tz_name }}">{{ ago(r.first_ts) }}</time></td>
+        <td class="col-act">
+          <details class="dd row-menu" data-dd>
+            <summary class="icon-btn ghost" aria-label="Actions for {{ r.address or r.queue_id or 'message' }}">{{ icon("dots") }}</summary>
+            <div class="dd-menu right" role="menu">
+              <a class="dd-item" role="menuitem" href="/emails/{{ r.id }}">{{ icon("open") }}<span>Open details</span></a>
+              {% if r.queue_id %}<button type="button" class="dd-item" role="menuitem" data-copy="{{ r.queue_id }}">{{ icon("copy") }}<span>Copy Queue ID</span><code>{{ r.queue_id }}</code></button>
+              {% else %}<span class="dd-item disabled">{{ icon("copy") }}<span>No Queue ID (NOQUEUE)</span></span>{% endif %}
+              {% if r.message_id %}<button type="button" class="dd-item" role="menuitem" data-copy="&lt;{{ r.message_id }}&gt;">{{ icon("copy") }}<span>Copy Message-ID</span></button>
+              {% else %}<span class="dd-item disabled">{{ icon("copy") }}<span>Message-ID not logged</span></span>{% endif %}
+            </div>
+          </details>
+        </td>
       </tr>
-    {% else %}
-      <tr><td colspan="8" class="empty">No emails match these filters.</td></tr>
     {% endfor %}
     </tbody>
-  </table></div>
-  {{ pager(data, page_url) }}
-</section>
+  </table>
+  {% if not data.rows %}
+  <div class="empty-state">
+    <div class="empty-icon">{{ icon("inbox") }}</div>
+    <h2>No emails found</h2>
+    {% if flt.q or flt.status or flt.sender is not none or flt.domain %}
+    <p>No email matches these filters in {{ ("the " ~ rng.label|lower) if rng.key != "custom" else "the selected range" }}. Try another search term or a wider time range.</p>
+    <p class="empty-actions"><a class="btn" href="/emails">Clear filters</a><a class="btn" href="{{ url(range='90d', start='', end='') }}">Search last 90 days</a></p>
+    {% else %}
+    <p>Postfix has not logged any email in {{ ("the " ~ rng.label|lower) if rng.key != "custom" else "the selected range" }}.</p>
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+
+{% if data.rows %}
+<nav class="pager" aria-label="Pagination">
+  <span class="muted small">{{ "{:,}".format((data.page - 1) * data.per_page + 1) }}–{{ "{:,}".format([data.page * data.per_page, data.total]|min) }} of {{ "{:,}".format(data.total) }}{% if data.capped %}+{% endif %} emails</span>
+  <span class="pager-links">
+    {% if data.page > 1 %}<a class="btn small" href="{{ url(page=data.page - 1) }}" rel="prev">{{ icon("chevron-left") }}Previous</a>{% else %}<span class="btn small disabled">{{ icon("chevron-left") }}Previous</span>{% endif %}
+    <span class="small muted">Page {{ data.page }} of {{ data.pages }}{% if data.capped %}+{% endif %}</span>
+    {% if data.page < data.pages %}<a class="btn small" href="{{ url(page=data.page + 1) }}" rel="next">Next{{ icon("chevron-right") }}</a>{% else %}<span class="btn small disabled">Next{{ icon("chevron-right") }}</span>{% endif %}
+  </span>
+</nav>
+{% if data.capped %}<p class="hint">More than {{ "{:,}".format(data.total) }} emails match. Narrow the search or time range to see the rest; counts and paging stop at {{ "{:,}".format(data.total) }} to keep queries fast.</p>{% endif %}
+{% endif %}
 {% endblock %}

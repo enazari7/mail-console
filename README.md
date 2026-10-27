@@ -16,8 +16,8 @@ Phase 1 scope and its limits are listed under [Limitations](#limitations).
 | Page | Contents |
 |---|---|
 | **Overview** | Accepted deliveries, deferrals, bounced/expired/rejected, error rate, current queue size, SMTP activity over time, destination domains, queue-size trend, recent problems. Ranges: 1h, 24h, 7d, 30d, 90d or custom. |
-| **Emails** | Paginated table, one row per recipient: date, sender, recipient, subject (only when Postfix logs it), status, destination domain, SMTP response summary, Queue ID. Search by sender, recipient, Queue ID (exact or prefix) or Message-ID; filter by status, domain and date range. |
-| **Email details** | Message metadata, per-recipient status with DSN, relay, attempts, deferrals and delay, related messages (bounce notices, requeues, reused Queue IDs), and a timeline of every log line for the message, with the raw (redacted) line. Missing evidence is stated explicitly. |
+| **Emails** | One row per recipient: recipient (with sender), status, subject (only when Postfix logs it), relative "sent" time with the exact time on hover, and an actions menu (open, copy Queue ID, copy Message-ID). Toolbar: search, time range (24h/7d/15d/30d/90d/custom), status, sender (picked from senders actually seen) and CSV export. Filters combine with AND, live in the URL (bookmarkable) and survive paging and sorting. Sort by sent time, recipient or status; server-side pagination; whole rows are clickable. |
+| **Email details** | Metadata (sender, recipients, subject, Message-ID, Queue ID, status, first/last/final timestamps, attempts, deferred attempts, relay, DSN), Delivery events (per-recipient table and a timeline of every log line, raw line included, redacted), related messages, and a Message content section that reads "Content not retained" unless an approved capture mechanism stored content. Missing evidence is stated explicitly. |
 | **Monitoring** | Postfix, Mailguard, OpenDKIM and Dovecot unit state; queue size by queue, oldest message, queued entries with deferral reasons; collector health and checkpoint; recent operational warnings/errors from the logs. Read-only. |
 | **Settings** | Administrator account, password change, active sessions, data retention, time zone, page size, theme (system/dark/light). |
 
@@ -27,7 +27,7 @@ The console reports only what the logs prove.
 
 | Status | Evidence |
 |---|---|
-| **Accepted** | Postfix logged `status=sent`: the next-hop server answered SMTP 2xx. This is **not** proof of inbox placement, opening or reading. There is no open or click tracking. |
+| **Accepted by destination** | Postfix logged `status=sent`: the next-hop server answered SMTP 2xx. This is **not** proof of inbox placement, opening or reading. There is no open or click tracking, and a later asynchronous bounce from the destination is not correlated yet. |
 | **Deferred** | Latest attempt was a temporary failure (`status=deferred`, 4xx or connection problem). Postfix will retry. |
 | **Bounced** | Permanent failure (`status=bounced`, 5xx). |
 | **Expired** | The queue manager logged `status=expired, returned to sender` after deferrals. |
@@ -87,6 +87,31 @@ systemctl show / postqueue -j ◀─┘  every 30 s (read-only)
    events after each batch, so the result does not depend on ingestion order
    (tested by ingesting the fixture forward, reversed and shuffled).
 
+### Search
+
+Search is case-insensitive and matches inside recipient and sender addresses,
+Queue IDs, Message-IDs, subjects (when logged), destination domains and the
+SMTP responses of failed recipients.
+
+* Terms of **3 or more characters** use an SQLite **FTS5 trigram index**
+  (`message_search`, one document per message, kept in step by the collector).
+  The index selects candidate messages; a row-level check then keeps only
+  recipient rows that actually contain the term, so searching one recipient of
+  a multi-recipient message does not list the others.
+* **Shorter terms** match only an exact Queue ID, recipient address or domain
+  (indexed equality); the page says so.
+* User input is never interpreted as FTS or SQL syntax: it is bound as a
+  quoted FTS phrase and as `instr()` arguments, so `%`, `_`, quotes and FTS
+  operators match literally.
+* Result counts stop at 10,000 ("10,000+") so a broad search costs a bounded
+  amount of work; narrow the search or range to page further.
+* Filtering by status, sender or time uses indexes on `messages`; the
+  combination of a broad time range with a rare status still walks that time
+  range. `scripts/bench_search.py` measures all of this on synthetic data;
+  with 100,000 messages over 90 days, page loads take 0.2–65 ms, a search for a
+  very common term ("example.org", 10,000+ matches) about 210 ms, and a 50,000-row
+  CSV export about 175 ms (x86-64 development machine).
+
 ### Growth controls
 
 * Retention (default 90 days, Settings) deletes messages by last activity, hourly.
@@ -127,6 +152,7 @@ All commands run as the service user through the `/usr/local/sbin/mail-console` 
 | `mail-console admin unlock` | Clear login throttling after repeated failed attempts |
 | `mail-console migrate` | Apply database migrations |
 | `mail-console purge` | Apply retention now |
+| `mail-console reindex` | Rebuild the full-text search index (normally maintained automatically) |
 | `mail-console serve` / `collect` | What the systemd units run |
 
 ## Development
@@ -153,6 +179,13 @@ EOF
 .venv/bin/python -m mailconsole --env-file /tmp/mc.env serve
 ```
 
+Synthetic data for demos and benchmarks (reserved example domains only):
+
+```bash
+.venv/bin/python scripts/demo_data.py --messages 2000 --days 15 > /tmp/demo-syslog
+.venv/bin/python scripts/bench_search.py --messages 100000 --days 90
+```
+
 Tests cover parsing, Queue ID correlation and reuse, multiple recipients,
 retries and final outcomes, duplicates, rotation and restart, time zones,
 authentication and sessions, search/filter/pagination, storage and migrations,
@@ -176,9 +209,12 @@ uninstall cycle on an Ubuntu 24.04 ARM64 runner without Docker.
   change that is out of scope).
 * **Single role.** Every account is a full administrator; there is no 2FA.
   Use an SSH tunnel or a reverse proxy with network restrictions.
-* **Search** is a case-insensitive substring match across sender, recipient,
-  Queue ID, Message-ID and SASL user, which scans rows; it is intended for up to
-  a few million recipient rows.
+* **Search** substring matching needs 3+ characters; status-only filters over
+  long ranges walk that range (see [Search](#search)). Counts are capped at 10,000.
+* **Receiving** (inbound mail) is not tracked; the tab is shown as unavailable.
+* **Message content** is not captured. The UI and a `message_content` table are
+  ready for a future, separately approved capture service; HTML would render only
+  in a sandboxed, script-free frame with remote resources blocked.
 * **Charts** bucket by the display zone's UTC offset at the end of the range;
   across a DST change, day buckets shift by an hour.
 * **journald source** is implemented and tested with a simulated `journalctl`;

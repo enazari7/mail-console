@@ -20,6 +20,7 @@ import sqlite3
 from dataclasses import dataclass, field
 from typing import Iterable
 
+from . import search
 from .parser import Classified, redact
 
 SKEW_US = 2_000_000          # tolerated clock/order skew between daemons
@@ -280,7 +281,12 @@ def _detail(ev) -> dict:
 # --- derived state ---------------------------------------------------------
 
 def recompute_message(conn: sqlite3.Connection, message_id: int) -> None:
-    """Rebuild a message's summary and recipient rows from its events."""
+    """Rebuild a message's summary, recipient rows and search document from its events."""
+    _recompute(conn, message_id)
+    search.update(conn, message_id)
+
+
+def _recompute(conn: sqlite3.Connection, message_id: int) -> None:
     events = conn.execute(
         "SELECT * FROM events WHERE message_id = ? ORDER BY ts, id", (message_id,)
     ).fetchall()

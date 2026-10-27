@@ -124,6 +124,24 @@ applies migrations, switches the `current` symlink atomically, restarts only the
 two console services and waits for `/healthz`. The previous release directory is
 kept for rollback.
 
+### Upgrading to the EMAILS-UX-02 release
+
+* Migration `0002_search_and_content` adds the `message_search` FTS5 table, an
+  empty `message_content` table and two indexes (one of them, on
+  `events(queue_id, host)`, fixes slow correlation on large histories), then
+  builds the search index for existing messages in chunks of 2,000. It runs
+  inside `update.sh` before the services restart. Measured on the synthetic
+  benchmark (x86-64 development machine): 5.3 s per 100,000 messages for the
+  search index; expect it to take a few times longer on the ARM64 server.
+* Storage: the 100,000-message / 90-day benchmark database is about 500 MiB
+  (≈5 KB per message including the redacted raw log line of every event and a
+  70 MiB search index). `MC_STORE_RAW_LINES=false` drops the raw lines;
+  `MC_MAX_DB_MB` and retention bound the total.
+* Requires SQLite with FTS5 and the trigram tokenizer (SQLite ≥ 3.34, both
+  present in Ubuntu 24.04's `libsqlite3-0` 3.45). `mail-console check` reports
+  "search index complete".
+* No configuration changes. No new services, ports or dependencies.
+
 ## Rollback
 
 ```bash
@@ -132,7 +150,11 @@ sudo /usr/local/src/mail-console/deploy/rollback.sh --restore-db # code and pre-
 ```
 
 Use `--restore-db` when the newer release applied a migration the older code
-does not understand (`mail-console check` reports the schema state). Events
+does not understand (`mail-console check` reports the schema state).
+
+Rolling back from the EMAILS-UX-02 release without `--restore-db` is safe: the
+older code ignores the new tables. It does not maintain the search index, so
+after rolling forward again run `sudo mail-console reindex`. Events
 ingested after the update are lost by `--restore-db`; they are re-read from the
 log on the next start only while they are still in the current log file. The
 replaced database is kept as `mail-console.sqlite3.rolled-back`.
@@ -156,6 +178,7 @@ console never affects Postfix.
 | Collector status | Monitoring page → Collector, or `sudo mail-console check` |
 | Reset a password | `sudo mail-console admin reset-password --username admin` (signs out all sessions) |
 | Locked out by throttling | `sudo mail-console admin unlock` |
+| Search index incomplete | `sudo mail-console reindex` |
 | Apply retention now | `sudo mail-console purge` |
 | Database backup | `sudo -u mailconsole sqlite3 /var/lib/mail-console/mail-console.sqlite3 ".backup /var/lib/mail-console/backups/manual.sqlite3"` (or copy while the services are stopped) |
 | Re-ingest from scratch | stop both services, move the database away, `sudo mail-console migrate`, `sudo mail-console import --rotated`, recreate the admin, start |

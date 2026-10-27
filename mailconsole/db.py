@@ -111,7 +111,19 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
                 conn.execute("ROLLBACK")
             raise
         applied.append(name)
+        post = POST_MIGRATION.get(version)
+        if post:
+            post(conn)
     return applied
+
+
+def _rebuild_search(conn: sqlite3.Connection) -> None:
+    from .search import rebuild
+    rebuild(conn)
+
+
+# Python steps that run once, right after the migration of the same version.
+POST_MIGRATION = {2: _rebuild_search}
 
 
 def pending_migrations(conn: sqlite3.Connection) -> list[str]:

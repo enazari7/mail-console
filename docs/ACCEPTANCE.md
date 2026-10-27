@@ -35,6 +35,11 @@ after installation; none of them changes the mail stack.
       its DSN and remote SMTP response
 - [ ] **Charts and pagination**: Overview charts render for 24h/7d/30d; Emails
       pagination moves between pages
+- [ ] **Emails toolbar**: search, time range, status and sender filters combine;
+      the URL reproduces the view; sorting by Sent/To/Status works; the row
+      menu copies Queue ID and Message-ID; CSV export downloads the filtered rows
+- [ ] **Search index**: `sudo mail-console check` reports "search index complete"
+- [ ] **Content**: details page shows "Content not retained" (no capture is enabled)
 - [ ] **Monitoring**: unit states for Postfix, Mailguard, OpenDKIM, Dovecot are
       correct; queue count matches `postqueue -j | wc -l`
 - [ ] **Restart**: `sudo systemctl restart mail-console-collector mail-console-web`;

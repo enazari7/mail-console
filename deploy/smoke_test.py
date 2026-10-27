@@ -12,6 +12,7 @@ from creating (and then closing) one login session.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
 from html import escape as html_escape
 import re
 import sys
@@ -56,6 +57,7 @@ def main() -> int:
     p.add_argument("--username", required=True)
     p.add_argument("--password-stdin", action="store_true", required=True)
     p.add_argument("--expect", action="append", default=[], help="search term that must return results")
+    p.add_argument("--days", type=int, default=400, help="search window ending now (default 400 days)")
     args = p.parse_args()
     if not args.url.startswith(("http://", "https://")):
         p.error("--url must be http(s)")
@@ -84,17 +86,23 @@ def main() -> int:
     check(status == 303 and "mc_session" in c.cookies, "administrator login succeeds")
     if "mc_session" not in c.cookies:
         return 1
-    for path in ("/", "/?range=7d", "/emails", "/monitoring", "/settings"):
+    for path in ("/", "/?range=7d", "/emails", "/emails?status=accepted&sort=recipient", "/monitoring", "/settings"):
         status, _, html = c.request(path)
         check(status == 200 and "Mail Console" in html, f"GET {path} renders")
     for term in args.expect:
-        status, _, html = c.request("/emails?" + urllib.parse.urlencode({"q": term}))
+        end = datetime.now(timezone.utc) + timedelta(days=1)
+        window = {"range": "custom", "start": (end - timedelta(days=args.days)).strftime("%Y-%m-%dT%H:%M"),
+                  "end": end.strftime("%Y-%m-%dT%H:%M")}
+        status, _, html = c.request("/emails?" + urllib.parse.urlencode({"q": term, **window}))
         detail = re.search(r'href="(/emails/\d+)"', html)
         check(status == 200 and "No emails match" not in html and detail is not None, f"search finds {term!r}")
         if detail:
             status, _, page = c.request(detail.group(1))
             check(status == 200 and "Timeline" in page and html_escape(term).lower() in page.lower(),
                   f"detail page for {term!r} shows it with a timeline")
+    status, headers, body = c.request("/emails/export.csv?range=90d")
+    check(status == 200 and headers.get("Content-Type", "").startswith("text/csv") and body.startswith("\ufeffsent_at_utc"),
+          "CSV export works")
     status, _, html = c.request("/")
     token = re.search(r'name="csrf_token" value="([^"]+)"', html)
     if token:

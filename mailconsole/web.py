@@ -2,18 +2,20 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import ipaddress
 from html import escape as html_escape
 import secrets
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib import resources
 from typing import Iterator
 from urllib.parse import urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -27,8 +29,48 @@ SESSION_COOKIE = "mc_session"
 LOGIN_CSRF_COOKIE = "mc_login_csrf"
 PAGE_SIZES = (25, 50, 100)
 THEMES = ("system", "dark", "light")
-CSP = ("default-src 'none'; style-src 'self'; img-src 'self' data:; font-src 'self'; form-action 'self'; "
-       "frame-ancestors 'none'; base-uri 'none'")
+CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; "
+       "connect-src 'none'; frame-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+# Retained email HTML: opaque origin, no scripts, no plugins, nothing remote.
+PREVIEW_CSP = ("sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src 'none'; "
+               "form-action 'none'; frame-ancestors 'self'; base-uri 'none'")
+EXPORT_MAX_ROWS = 50_000
+EMAIL_RANGES = [("24h", "Last 24 hours"), ("7d", "Last 7 days"), ("15d", "Last 15 days"),
+                ("30d", "Last 30 days"), ("90d", "Last 90 days")]
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_cell(value) -> str:
+    """Render a CSV cell, neutralising spreadsheet formulas (CSV injection)."""
+    text = "" if value is None else str(value)
+    text = text.replace("\x00", "")
+    if text.startswith(_FORMULA_PREFIXES):
+        text = "'" + text
+    return text
+
+
+def csv_lines(rows, display: "Display"):
+    """Yield CSV text chunks (UTF-8 with BOM for spreadsheet compatibility)."""
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\r\n")
+
+    def take() -> str:
+        text = buf.getvalue()
+        buf.seek(0)
+        buf.truncate()
+        return text
+
+    writer.writerow(["sent_at_utc", f"sent_at_{display.tz_name}", "recipient", "status", "sender", "subject",
+                     "destination_domain", "dsn", "smtp_response", "relay", "attempts", "queue_id", "message_id"])
+    yield "\ufeff" + take()
+    for r in rows:
+        status = r["row_status"]
+        writer.writerow([csv_cell(x) for x in (
+            datetime.fromtimestamp(r["first_ts"] / US, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            display.ts(r["first_ts"]), r["address"], STATUS_LABELS.get(status, status), r["sender"],
+            r["subject"], r["domain"], r["dsn"], r["response"] if r["address"] is not None else r["last_response"],
+            r["relay"], r["attempts"], r["queue_id"], r["message_id"])])
+        yield take()
 
 
 class LoginRequired(Exception):
@@ -103,6 +145,21 @@ class Display:
         dt = self.dt(us)
         return dt.strftime(fmt) if dt else "—"
 
+    def range_label(self, rng) -> str:
+        """Short label for a time range; custom ranges show their dates."""
+        if rng.key != "custom":
+            return rng.label
+        start, end = self.dt(rng.start), self.dt(rng.end)
+        midnight = all(d.hour == 0 and d.minute == 0 for d in (start, end))
+        fmt = "%b %d" if midnight else "%b %d %H:%M"
+        if start.year != end.year:
+            fmt = "%b %d, %Y" if midnight else "%b %d, %Y %H:%M"
+        return f"{start.strftime(fmt)} – {end.strftime(fmt)}"
+
+    def iso(self, us: int | None) -> str:
+        dt = self.dt(us)
+        return dt.isoformat(timespec="seconds") if dt else ""
+
     def ts_ms(self, us: int | None) -> str:
         dt = self.dt(us)
         return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}" if dt else "—"
@@ -122,7 +179,9 @@ def ago(us: int | None, now: int) -> str:
         return f"{seconds // 60}m ago"
     if seconds < 86400:
         return f"{seconds // 3600}h ago"
-    return f"{seconds // 86400}d ago"
+    if seconds < 30 * 86400:
+        return f"{seconds // 86400}d ago"
+    return datetime.fromtimestamp(us / US, timezone.utc).strftime("%b %d, %Y")
 
 
 def duration(seconds: float | None) -> str:
@@ -238,9 +297,9 @@ def create_app(cfg: Config) -> FastAPI:
             if request.headers.get("sec-fetch-site") == "cross-site":
                 return Response("Cross-site request refused", status_code=403, media_type="text/plain")
         response = await call_next(request)
-        response.headers["Content-Security-Policy"] = CSP
+        response.headers.setdefault("Content-Security-Policy", CSP)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers["Referrer-Policy"] = "same-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
@@ -365,23 +424,71 @@ def create_app(cfg: Config) -> FastAPI:
                       queue_chart=charts.sparkline(data["queue_history"], lambda us: display.ts(us, "%m-%d %H:%M")),
                       refresh=request.query_params.get("refresh") == "1")
 
+    def email_filter(conn: sqlite3.Connection, display: "Display", params) -> tuple:
+        """Parse the Emails query string into a filter and the canonical URL parameters."""
+        get = lambda key: (params.get(key) or "").strip()  # noqa: E731
+        rng = queries.resolve_range(get("range"), get("start"), get("end"), display.tz, now_us(), default="15d")
+        status = get("status") if get("status") in queries.FILTER_STATUSES else ""
+        sender_raw = params.get("sender")
+        sender = None if sender_raw is None or sender_raw.strip() == "" else (
+            "" if sender_raw.strip() == "<>" else sender_raw.strip()[:320])
+        sort = get("sort") if get("sort") in queries.SORTS else "sent"
+        direction = "asc" if get("dir") == "asc" else "desc"
+        flt = queries.ActivityFilter(q=get("q")[:320], status=status, domain=get("domain")[:255].lower(),
+                                     sender=sender, start=rng.start, end=rng.end, sort=sort, direction=direction)
+        canonical = {
+            "q": flt.q, "status": status, "domain": flt.domain,
+            "sender": ("<>" if sender == "" else sender) if sender is not None else "",
+            "range": rng.key if rng.key != "15d" else "",
+            "start": get("start") if rng.key == "custom" else "", "end": get("end") if rng.key == "custom" else "",
+            "sort": sort if sort != "sent" else "", "dir": direction if direction != "desc" else "",
+        }
+        return flt, rng, {k: v for k, v in canonical.items() if v}
+
     @app.get("/emails", response_class=HTMLResponse)
-    def emails_page(request: Request, q: str = "", status: str = "", domain: str = "", range: str = "all",
-                    start: str = "", end: str = "", page: int = 1,
-                    session: auth.Session = Depends(session_dep), conn: sqlite3.Connection = Depends(get_db)):
+    def emails_page(request: Request, page: int = 1, session: auth.Session = Depends(session_dep),
+                    conn: sqlite3.Connection = Depends(get_db)):
         display = Display(conn)
-        rng = queries.resolve_range(range, start, end, display.tz, now_us(), default="all", allow_all=True)
-        status = status if status in queries.FILTER_STATUSES else ""
-        flt = queries.ActivityFilter(q=q[:320], status=status, domain=domain[:255], start=rng.start, end=rng.end)
+        flt, rng, state = email_filter(conn, display, request.query_params)
         data = queries.activity(conn, flt, page, display.page_size)
-        params = {k: v for k, v in {"q": q, "status": status, "domain": domain, "range": rng.key,
-                                    "start": start if rng.key == "custom" else "",
-                                    "end": end if rng.key == "custom" else ""}.items() if v}
-        def page_url(n: int) -> str:
-            return "/emails?" + urlencode({**params, "page": n})
-        return render(request, conn, "emails.html", session, data=data, flt=flt, rng=rng, start=start, end=end,
-                      page_url=page_url, refresh=request.query_params.get("refresh") == "1",
-                      refresh_url="/emails?" + urlencode({**params, "page": data["page"], "refresh": 1}))
+
+        def url(_path: str = "/emails", **changes) -> str:
+            merged = {**state, **{k: v for k, v in changes.items()}}
+            merged = {k: v for k, v in merged.items() if v not in (None, "")}
+            return _path + ("?" + urlencode(merged) if merged else "")
+
+        def sort_url(column: str) -> str:
+            if flt.sort == column:
+                return url(sort=column if column != "sent" else "", dir="" if flt.direction == "asc" else "asc")
+            return url(sort=column if column != "sent" else "", dir="asc" if column != "sent" else "")
+
+        sender_options = queries.senders(conn, rng.start, rng.end)
+        if flt.sender is not None and flt.sender not in {o["sender"] for o in sender_options}:
+            sender_options.insert(0, {"sender": flt.sender, "n": None})
+        return render(request, conn, "emails.html", session, data=data, flt=flt, rng=rng, state=state, url=url,
+                      sort_url=sort_url, sender_options=sender_options, ranges=EMAIL_RANGES,
+                      export_limit=EXPORT_MAX_ROWS, refresh=request.query_params.get("refresh") == "1")
+
+    @app.get("/emails/export.csv")
+    def export_csv(request: Request, session: auth.Session = Depends(session_dep),
+                   conn: sqlite3.Connection = Depends(get_db)):
+        display = Display(conn)
+        flt, _, _ = email_filter(conn, display, request.query_params)
+        truncated = queries.count_rows(conn, flt, EXPORT_MAX_ROWS + 1) > EXPORT_MAX_ROWS
+        stamp = datetime.now(display.tz).strftime("%Y%m%d-%H%M")
+        headers = {"Content-Disposition": f'attachment; filename="mail-console-emails-{stamp}.csv"',
+                   "X-Export-Truncated": "true" if truncated else "false",
+                   "X-Export-Max-Rows": str(EXPORT_MAX_ROWS)}
+
+        def generate():
+            # Own connection: the generator outlives the request dependency.
+            export_conn = connect(cfg.db_path)
+            try:
+                yield from csv_lines(queries.export_rows(export_conn, flt, EXPORT_MAX_ROWS), display)
+            finally:
+                export_conn.close()
+
+        return StreamingResponse(generate(), media_type="text/csv; charset=utf-8", headers=headers)
 
     @app.get("/emails/{message_id}", response_class=HTMLResponse)
     def email_detail(request: Request, message_id: int, session: auth.Session = Depends(session_dep),
@@ -390,6 +497,24 @@ def create_app(cfg: Config) -> FastAPI:
         if detail is None:
             raise StarletteHTTPException(404, "Message not found.")
         return render(request, conn, "email_detail.html", session, d=detail)
+
+    @app.get("/emails/{message_id}/content-preview")
+    def content_preview(message_id: int, session: auth.Session = Depends(session_dep),
+                        conn: sqlite3.Connection = Depends(get_db)):
+        """Retained HTML body, for display only inside a sandboxed frame.
+
+        The response itself is sandboxed by CSP (opaque origin, no scripts, no
+        forms, no remote loads), so it cannot act in the console's origin even
+        if opened directly.
+        """
+        row = conn.execute("SELECT html_body FROM message_content WHERE message_id = ?", (message_id,)).fetchone()
+        if row is None or not row["html_body"]:
+            raise StarletteHTTPException(404, "No retained HTML content.")
+        return HTMLResponse(row["html_body"], headers={
+            "Content-Security-Policy": PREVIEW_CSP,
+            "X-Frame-Options": "SAMEORIGIN",
+            "Cross-Origin-Resource-Policy": "same-origin",
+        })
 
     @app.get("/queue/{queue_id}")
     def by_queue_id(queue_id: str, session: auth.Session = Depends(session_dep),
