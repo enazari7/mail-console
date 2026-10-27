@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import io
 import ipaddress
+import re
 from html import escape as html_escape
 import secrets
 import sqlite3
@@ -419,7 +420,14 @@ def create_app(cfg: Config) -> FastAPI:
         tick_fmt = "%H:%M" if (rng.end - rng.start) <= queries.DAY else "%b %d" if rng.bucket >= 6 * queries.HOUR else "%d %H:%M"
         chart = charts.stacked_bars(data["buckets"], lambda us: display.ts(us, "%Y-%m-%d " + fmt),
                                     lambda us: display.ts(us, tick_fmt))
-        return render(request, conn, "overview.html", session, rng=rng, data=data, chart=chart,
+        range_params = {"range": rng.key}
+        if rng.key == "custom":
+            range_params.update(start=display.local_input(rng.start), end=display.local_input(rng.end))
+
+        def emails_link(**params) -> str:
+            return "/emails?" + urlencode({**params, **range_params})
+
+        return render(request, conn, "overview.html", session, rng=rng, data=data, chart=chart, emails_link=emails_link,
                       domain_chart=charts.domain_bars(data["domains"]),
                       queue_chart=charts.sparkline(data["queue_history"], lambda us: display.ts(us, "%m-%d %H:%M")),
                       refresh=request.query_params.get("refresh") == "1")
@@ -434,7 +442,10 @@ def create_app(cfg: Config) -> FastAPI:
             "" if sender_raw.strip() == "<>" else sender_raw.strip()[:320])
         sort = get("sort") if get("sort") in queries.SORTS else "sent"
         direction = "asc" if get("dir") == "asc" else "desc"
-        flt = queries.ActivityFilter(q=get("q")[:320], status=status, domain=get("domain")[:255].lower(),
+        q = get("q").replace("\x00", "")[:320]
+        if not queries.ActivityFilter(q=q).term:
+            q = ""  # e.g. "<>" alone: nothing to search for
+        flt = queries.ActivityFilter(q=q, status=status, domain=get("domain")[:255].lower(),
                                      sender=sender, start=rng.start, end=rng.end, sort=sort, direction=direction)
         canonical = {
             "q": flt.q, "status": status, "domain": flt.domain,
@@ -476,7 +487,8 @@ def create_app(cfg: Config) -> FastAPI:
         flt, _, _ = email_filter(conn, display, request.query_params)
         truncated = queries.count_rows(conn, flt, EXPORT_MAX_ROWS + 1) > EXPORT_MAX_ROWS
         stamp = datetime.now(display.tz).strftime("%Y%m%d-%H%M")
-        headers = {"Content-Disposition": f'attachment; filename="mail-console-emails-{stamp}.csv"',
+        suffix = f"-first-{EXPORT_MAX_ROWS}-rows" if truncated else ""
+        headers = {"Content-Disposition": f'attachment; filename="mail-console-emails-{stamp}{suffix}.csv"',
                    "X-Export-Truncated": "true" if truncated else "false",
                    "X-Export-Max-Rows": str(EXPORT_MAX_ROWS)}
 
@@ -510,7 +522,9 @@ def create_app(cfg: Config) -> FastAPI:
         row = conn.execute("SELECT html_body FROM message_content WHERE message_id = ?", (message_id,)).fetchone()
         if row is None or not row["html_body"]:
             raise StarletteHTTPException(404, "No retained HTML content.")
-        return HTMLResponse(row["html_body"], headers={
+        # Belt and braces next to the sandbox CSP: drop meta refresh/redirects.
+        body = re.sub(r"<meta\b[^>]*http-equiv[^>]*>", "", row["html_body"], flags=re.IGNORECASE)
+        return HTMLResponse(body, headers={
             "Content-Security-Policy": PREVIEW_CSP,
             "X-Frame-Options": "SAMEORIGIN",
             "Cross-Origin-Resource-Policy": "same-origin",

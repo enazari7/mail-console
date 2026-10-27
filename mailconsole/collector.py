@@ -219,6 +219,23 @@ def run_monitor(conn: sqlite3.Connection, cfg: Config) -> None:
         monitor.record_queue(conn, queue)
 
 
+def sync_search_index(conn: sqlite3.Connection) -> None:
+    """Repair the search index if a collector without search support ran.
+
+    Every collector start records ``collector_started_ts``; only this version
+    also records ``search_synced_start`` with the same value. A mismatch means
+    an older release (e.g. before a rollback/roll-forward, or the old
+    collector during an upgrade) ingested data without updating the index.
+    """
+    from . import search
+    previous = get_state(conn, "collector_started_ts")
+    if previous is not None and previous != get_state(conn, "search_synced_start"):
+        log.warning("an older collector ran since the last start; re-synchronising the search index")
+        log.info("search index: %d documents rewritten", search.rebuild(conn))
+    elif search.missing_documents(conn):
+        log.info("search index: %d missing documents added", search.fill_missing(conn))
+
+
 class Collector:
     def __init__(self, cfg: Config, *, stop: threading.Event | None = None, enable_monitor: bool = True):
         self.cfg = cfg
@@ -252,8 +269,11 @@ class Collector:
             conn = connect(cfg.db_path)
             require_schema(conn)
             ingestor = make_ingestor(conn, cfg)
+            sync_search_index(conn)
+            started = str(now_us())
             with tx(conn):
-                set_state(conn, "collector_started_ts", str(now_us()))
+                set_state(conn, "collector_started_ts", started)
+                set_state(conn, "search_synced_start", started)
                 set_state(conn, "collector_source", self.source.name)
             log.info("collector started: source=%s db=%s", self.source.name, cfg.db_path)
             next_heartbeat = next_monitor = 0.0

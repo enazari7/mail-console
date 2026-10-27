@@ -11,7 +11,7 @@ from __future__ import annotations
 import sqlite3
 
 MIN_SUBSTRING = 3
-MAX_RESPONSE_CHARS = 300
+MAX_RESPONSE_CHARS = 2000  # stored responses are capped at 2,000 characters
 
 
 def phrase(term: str) -> str:
@@ -43,23 +43,53 @@ def update(conn: sqlite3.Connection, message_id: int) -> None:
         conn.execute("INSERT INTO message_search(rowid, doc) VALUES (?, ?)", (message_id, doc))
 
 
-def rebuild(conn: sqlite3.Connection, chunk: int = 2000) -> int:
-    """(Re)build every search document, in bounded transactions."""
-    from .db import tx
-    with tx(conn):
-        conn.execute("DELETE FROM message_search")
-    done, last = 0, 0
+def _chunks(conn: sqlite3.Connection, sql: str, chunk: int):
+    last = 0
     while True:
-        ids = [r[0] for r in conn.execute("SELECT id FROM messages WHERE id > ? ORDER BY id LIMIT ?", (last, chunk))]
+        ids = [r[0] for r in conn.execute(sql, (last, chunk))]
         if not ids:
-            return done
+            return
+        yield ids
+        last = ids[-1]
+
+
+def rebuild(conn: sqlite3.Connection, chunk: int = 2000) -> int:
+    """Rewrite every search document in place, in bounded transactions.
+
+    The index is never emptied first, so search keeps working (with at most
+    one stale document per message) while a rebuild runs.
+    """
+    from .db import tx
+    done = 0
+    for ids in _chunks(conn, "SELECT id FROM messages WHERE id > ? ORDER BY id LIMIT ?", chunk):
         with tx(conn):
             for message_id in ids:
                 update(conn, message_id)
         done += len(ids)
-        last = ids[-1]
+    with tx(conn):
+        conn.execute("DELETE FROM message_search WHERE rowid NOT IN (SELECT id FROM messages)")
+    return done
+
+
+def fill_missing(conn: sqlite3.Connection, chunk: int = 2000) -> int:
+    """Index messages that have no search document yet (e.g. after an interrupted rebuild)."""
+    from .db import tx
+    done = 0
+    sql = ("SELECT id FROM messages WHERE id > ? AND id NOT IN (SELECT rowid FROM message_search)"
+           " ORDER BY id LIMIT ?")
+    for ids in _chunks(conn, sql, chunk):
+        with tx(conn):
+            for message_id in ids:
+                update(conn, message_id)
+        done += len(ids)
+    return done
 
 
 def missing_documents(conn: sqlite3.Connection) -> int:
     return conn.execute("SELECT count(*) FROM messages WHERE id NOT IN (SELECT rowid FROM message_search)"
                         ).fetchone()[0]
+
+
+def fold(text: str | None) -> str:
+    """Unicode case folding used by both the SQL row check and the search term."""
+    return text.casefold() if text else ""

@@ -52,7 +52,7 @@ STATUS_GROUPS = {
 FILTER_STATUSES = ["queued", "processing", "deferred", "accepted", "bounced", "rejected", "expired", "partial",
                    "unknown", "removed", "failed"]
 # Statuses that describe the whole message rather than one recipient.
-MESSAGE_LEVEL_STATUSES = {"partial"}
+MESSAGE_LEVEL_STATUSES = {"partial", "processing"}
 
 
 # --- time ranges -----------------------------------------------------------
@@ -214,7 +214,7 @@ class ActivityFilter:
 
     @property
     def term(self) -> str:
-        q = self.q.strip()
+        q = self.q.replace("\x00", "").strip()
         return q[1:-1].strip() if q.startswith("<") and q.endswith(">") else q
 
     @property
@@ -223,7 +223,7 @@ class ActivityFilter:
 
 
 def _row_text(prefix_cols: list[str]) -> str:
-    return "lower(" + " || ' ' || ".join(f"coalesce({c}, '')" for c in prefix_cols) + ")"
+    return "mc_fold(" + " || ' ' || ".join(f"coalesce({c}, '')" for c in prefix_cols) + ")"
 
 
 def _activity_where(f: ActivityFilter) -> tuple[str, list]:
@@ -260,8 +260,8 @@ def _activity_where(f: ActivityFilter) -> tuple[str, list]:
         recipient_text = _row_text(["r.address", "r.orig_address", "r.domain",
                                     "CASE WHEN r.status != 'accepted' THEN r.response END"])
         clauses.append(f"(instr({message_text}, ?) > 0 OR instr({recipient_text}, ?) > 0"
-                       " OR (r.id IS NULL AND instr(lower(coalesce(m.last_response, '')), ?) > 0))")
-        args.extend([term.lower()] * 3)
+                       " OR (r.id IS NULL AND instr(mc_fold(coalesce(m.last_response, '')), ?) > 0))")
+        args.extend([search.fold(term)] * 3)
     elif term:
         # Too short for substring search: exact, indexed matches only.
         clauses.append("(m.queue_id = ? OR r.domain = ? OR r.address = ? COLLATE NOCASE)")
@@ -381,10 +381,10 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
         if requeued_as:
             related.append({"relation": "Requeued as", "queue_id": requeued_as["queue_id"],
                             "id": requeued_as["id"], "status": requeued_as["status"]})
-        reuse = conn.execute("SELECT count(*) FROM messages WHERE queue_id = ? AND id != ?",
-                             (msg["queue_id"], message_id)).fetchone()[0]
+        reuse, reuse_first = conn.execute("SELECT count(*) - 1, min(first_ts) FROM messages WHERE queue_id = ?",
+                                          (msg["queue_id"],)).fetchone()
     else:
-        reuse = 0
+        reuse, reuse_first = 0, None
 
     gaps = []
     if not msg["has_start"] and msg["origin"] not in ("dsn",):
@@ -417,7 +417,8 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
         "dsns": sorted({r["dsn"] for r in recipients if r["dsn"]}),
     }
     return {"message": msg, "recipients": recipients, "events": events, "related": related,
-            "reuse_count": reuse, "gaps": gaps, "content": content, "summary": summary}
+            "reuse_count": reuse, "reuse_first_ts": reuse_first, "gaps": gaps, "content": content,
+            "summary": summary}
 
 
 def resolve_queue_id(conn: sqlite3.Connection, queue_id: str) -> int | None:

@@ -52,7 +52,7 @@
   <div class="related">
     <span class="k">Related messages</span>
     <ul class="plain">{% for r in d.related %}<li>{{ r.relation }} {{ qid(r.queue_id, r.id) }}{% if r.status %} {{ badge(r.status) }}{% elif not r.id %} <span class="muted small">(not in retained logs)</span>{% endif %}</li>{% endfor %}
-    {% if d.reuse_count %}<li class="muted small">Postfix reused this Queue ID for {{ d.reuse_count }} other message(s); they are tracked separately. <a href="/emails?q={{ m.queue_id|urlencode }}&amp;range=90d">Show all</a></li>{% endif %}</ul>
+    {% if d.reuse_count %}<li class="muted small">Postfix reused this Queue ID for {{ d.reuse_count }} other message(s); they are tracked separately. <a href="/emails?{{ {'q': m.queue_id, 'range': 'custom', 'start': display.local_input(d.reuse_first_ts - 60000000), 'end': display.local_input(now + 86400000000)}|urlencode }}">Show all</a></li>{% endif %}</ul>
   </div>
   {% endif %}
 </section>

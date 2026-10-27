@@ -168,6 +168,7 @@
     {% if data.page < data.pages %}<a class="btn small" href="{{ url(page=data.page + 1) }}" rel="next">Next{{ icon("chevron-right") }}</a>{% else %}<span class="btn small disabled">Next{{ icon("chevron-right") }}</span>{% endif %}
   </span>
 </nav>
+{% if data.capped %}<p class="hint">CSV export contains at most {{ "{:,}".format(export_limit) }} rows; narrow the filters to export everything.</p>{% endif %}
 {% if data.capped %}<p class="hint">More than {{ "{:,}".format(data.total) }} emails match. Narrow the search or time range to see the rest; counts and paging stop at {{ "{:,}".format(data.total) }} to keep queries fast.</p>{% endif %}
 {% endif %}
 {% endblock %}

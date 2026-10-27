@@ -118,10 +118,13 @@ sudo git fetch && sudo git checkout <reviewed commit SHA>
 sudo ./deploy/update.sh
 ```
 
-`update.sh` installs a new release next to the current one, backs up the
-database to `/var/lib/mail-console/backups/pre-<release>.sqlite3` (last 5 kept),
-applies migrations, switches the `current` symlink atomically, restarts only the
-two console services and waits for `/healthz`. The previous release directory is
+`update.sh` installs a new release next to the current one, stops the two
+console services (never the mail services), backs up the database to
+`/var/lib/mail-console/backups/pre-<release>.sqlite3` (last 5 kept), applies
+migrations, switches the `current` symlink atomically, starts the console
+services again and waits for `/healthz`. If anything fails before the switch,
+the previous release is started again automatically. While the console is
+stopped, Postfix keeps logging; the collector catches up from its checkpoint. The previous release directory is
 kept for rollback.
 
 ### Upgrading to the EMAILS-UX-02 release
@@ -140,7 +143,16 @@ kept for rollback.
 * Requires SQLite with FTS5 and the trigram tokenizer (SQLite ≥ 3.34, both
   present in Ubuntu 24.04's `libsqlite3-0` 3.45). `mail-console check` reports
   "search index complete".
-* No configuration changes. No new services, ports or dependencies.
+* No configuration changes are required. No new services, ports or dependencies.
+* Search-index safety: every `migrate` completes missing documents (so an
+  interrupted rebuild is finished by simply re-running `update.sh`), and the new
+  collector re-synchronises the index at startup whenever an older collector has
+  run since its last start. `sudo mail-console reindex` remains available.
+* New default `MC_MONITOR_UNITS` in `.env.example` (an existing
+  `/etc/mail-console/mail-console.env` is never overwritten): consider adding
+  `Postfix-master=postfix@-.service` to it, because `postfix.service` on Ubuntu
+  is a one-shot wrapper that stays "active (exited)" even if the Postfix master
+  process stops.
 
 ## Rollback
 
@@ -153,8 +165,10 @@ Use `--restore-db` when the newer release applied a migration the older code
 does not understand (`mail-console check` reports the schema state).
 
 Rolling back from the EMAILS-UX-02 release without `--restore-db` is safe: the
-older code ignores the new tables. It does not maintain the search index, so
-after rolling forward again run `sudo mail-console reindex`. Events
+older code ignores the new tables. It does not maintain the search index; when
+you roll forward again, the new collector detects this at startup and
+re-synchronises the index automatically (`sudo mail-console reindex` does the
+same by hand). Events
 ingested after the update are lost by `--restore-db`; they are re-read from the
 log on the next start only while they are still in the current log file. The
 replaced database is kept as `mail-console.sqlite3.rolled-back`.

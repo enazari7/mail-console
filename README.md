@@ -109,8 +109,8 @@ SMTP responses of failed recipients.
   combination of a broad time range with a rare status still walks that time
   range. `scripts/bench_search.py` measures all of this on synthetic data;
   with 100,000 messages over 90 days, page loads take 0.2–65 ms, a search for a
-  very common term ("example.org", 10,000+ matches) about 210 ms, and a 50,000-row
-  CSV export about 175 ms (x86-64 development machine).
+  very common term ("example.org", 10,000+ matches) about 250 ms, and a 50,000-row
+  CSV export about 155 ms (x86-64 development machine).
 
 ### Growth controls
 
@@ -209,7 +209,7 @@ uninstall cycle on an Ubuntu 24.04 ARM64 runner without Docker.
   change that is out of scope).
 * **Single role.** Every account is a full administrator; there is no 2FA.
   Use an SSH tunnel or a reverse proxy with network restrictions.
-* **Search** substring matching needs 3+ characters; status-only filters over
+* **Search** is case-insensitive including non-ASCII letters; substring matching needs 3+ characters; status-only filters over
   long ranges walk that range (see [Search](#search)). Counts are capped at 10,000.
 * **Receiving** (inbound mail) is not tracked; the tab is shown as unavailable.
 * **Message content** is not captured. The UI and a `message_content` table are

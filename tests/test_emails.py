@@ -347,3 +347,94 @@ def test_correlation_lookup_by_queue_id_is_indexed(db):
         "EXPLAIN QUERY PLAN SELECT id, ts, kind, message_id FROM events WHERE queue_id = ? AND host IS ?",
         ("ABCDEF1234", "mail")))
     assert "USING INDEX ix_events_qid" in detail
+
+
+# --- integration-review regressions ------------------------------------------
+
+def test_migrate_completes_an_interrupted_index_build(cfg):
+    from mailconsole import search
+    from tests.conftest import fixture_lines
+    conn = connect(cfg.db_path)
+    migrate(conn)
+    ingest_lines(conn, cfg, fixture_lines())
+    conn.execute("DELETE FROM message_search WHERE rowid % 2 = 0")  # rebuild interrupted half-way
+    assert search.missing_documents(conn) > 0
+    assert migrate(conn) == []  # nothing pending, but the index is completed
+    assert search.missing_documents(conn) == 0
+
+
+def test_collector_resyncs_index_after_an_older_collector_ran(cfg):
+    from mailconsole import search
+    from mailconsole.collector import sync_search_index
+    from mailconsole.db import set_state
+    from tests.conftest import fixture_lines
+    conn = connect(cfg.db_path)
+    migrate(conn)
+    ingest_lines(conn, cfg, fixture_lines())
+    # Simulate a Phase 1 collector: it records its start and changes data
+    # without touching the search index.
+    with tx(conn):
+        set_state(conn, "collector_started_ts", "1")
+        conn.execute("UPDATE message_search SET doc = 'stale'")
+        conn.execute("DELETE FROM message_search WHERE rowid = (SELECT max(id) FROM messages)")
+    sync_search_index(conn)
+    stale = [mid for mid, doc in conn.execute("SELECT rowid, doc FROM message_search")
+             if doc != search.build_doc(conn, mid)]
+    assert stale == [] and search.missing_documents(conn) == 0
+    # A start recorded by the current collector does not trigger another rebuild.
+    with tx(conn):
+        set_state(conn, "collector_started_ts", "2")
+        set_state(conn, "search_synced_start", "2")
+        conn.execute("UPDATE message_search SET doc = 'kept' WHERE rowid = 1")
+    sync_search_index(conn)
+    assert conn.execute("SELECT doc FROM message_search WHERE rowid = 1").fetchone()[0] == "kept"
+
+
+def test_nul_and_bracket_only_queries(logged_in):
+    assert emails(logged_in, q="abc\x00def") and "No emails found" in emails(logged_in, q="abc\x00def")
+    assert logged_in.get("/emails/export.csv", params={"q": "abc\x00def"}).status_code == 200
+    html = emails(logged_in, q="<>")
+    assert "Search:" not in html and row_count(html) > 0
+
+
+def test_unicode_case_insensitive_search(logged_in, db, cfg):
+    ingest_lines(db, cfg, [
+        "2026-10-22T09:00:00+00:00 mail postfix/smtpd[1]: ABCDEF0400: client=a[192.0.2.1]",
+        "2026-10-22T09:00:00.1+00:00 mail postfix/cleanup[2]: ABCDEF0400: info: header Subject: ÄRGER im Büro "
+        "from a[192.0.2.1]; from=<b@example.com> to=<Ünal@example.org> proto=ESMTP helo=<a>",
+        "2026-10-22T09:00:01+00:00 mail postfix/smtp[3]: ABCDEF0400: to=<Ünal@example.org>, relay=mx[192.0.2.9]:25, "
+        "delay=1, delays=0/0/1/0, dsn=2.0.0, status=sent (250 ok)",
+    ])
+    for q in ("ÄRGER", "ärger", "ünal@", "ÜNAL"):
+        assert recipients_in(emails(logged_in, q=q)) == ["Ünal@example.org"], q
+
+
+def test_processing_filter_includes_partly_delivered_messages(logged_in, db, cfg):
+    ingest_lines(db, cfg, [
+        "2026-10-22T09:00:00+00:00 mail postfix/smtpd[1]: ABCDEF0500: client=a[192.0.2.1]",
+        "2026-10-22T09:00:00.1+00:00 mail postfix/qmgr[2]: ABCDEF0500: from=<s@example.com>, size=1, nrcpt=2 (queue active)",
+        "2026-10-22T09:00:01+00:00 mail postfix/smtp[3]: ABCDEF0500: to=<first@example.org>, relay=mx[192.0.2.9]:25, "
+        "delay=1, delays=0/0/1/0, dsn=2.0.0, status=sent (250 ok)",
+    ])
+    assert "first@example.org" in recipients_in(emails(logged_in, status="processing"))
+
+
+def test_overview_links_keep_the_range(logged_in):
+    html = logged_in.get("/", params={"range": "90d"}).text
+    assert "/emails?status=failed&amp;range=90d" in html
+    assert re.search(r'/emails\?domain=example\.org&amp;range=90d', html)
+
+
+def test_export_filename_marks_truncation(logged_in, many, monkeypatch):
+    monkeypatch.setattr(web, "EXPORT_MAX_ROWS", 25)
+    resp = logged_in.get("/emails/export.csv", params={**FIXTURE_RANGE, "domain": "bulk.example.org"})
+    assert "-first-25-rows.csv" in resp.headers["content-disposition"]
+
+
+def test_preview_strips_meta_refresh(logged_in, db):
+    mid = db.execute("SELECT id FROM messages WHERE queue_id = '3F2A61C0D3'").fetchone()[0]
+    with tx(db):
+        db.execute("INSERT INTO message_content(message_id, captured_ts, source, html_body) VALUES (?, 1, 't', ?)",
+                   (mid, '<META HTTP-EQUIV="refresh" content="0;url=https://evil.example/"><p>x</p>'))
+    body = logged_in.get(f"/emails/{mid}/content-preview").text
+    assert "refresh" not in body.lower() and "<p>x</p>" in body
