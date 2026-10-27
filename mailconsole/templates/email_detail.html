@@ -105,6 +105,10 @@
     {% set envelope_sender = m.sender %}
     {% set envelope_rcpts = d.recipients|map(attribute="address")|list %}
     {% include "_content.html" %}
+  {% elif d.skips %}
+  <div class="banner error"><strong>The archive copy of this message was not stored.</strong>
+    {% for k in d.skips %}<br>{{ display.ts(k.captured_ts) }}: {{ k.reason }}{% if k.size %} ({{ k.size|human_bytes }}){% endif %}{% endfor %}
+    <br><span class="small">Delivery to the recipients was not affected.</span></div>
   {% else %}
   <div class="content-empty">
     <span class="empty-icon">{{ icon("lock") }}</span>

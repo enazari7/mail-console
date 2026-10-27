@@ -101,7 +101,7 @@ server, **only after review and approval**.
    ```bash
    sudo postconf -M "cleanup-archive/unix=cleanup-archive unix n - y - 0 cleanup"
    sudo postconf -P "cleanup-archive/unix/always_bcc=archive@mail-console.invalid"
-   sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/opt/mail-console/current/bin/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
+   sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/usr/local/libexec/mail-console/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
    ```
 
 5. The **only change to an existing service**: let authenticated submission use
@@ -134,15 +134,20 @@ server, **only after review and approval**.
 
 ### Failure behaviour
 
+Two rules guide it. Storage pressure must never hold mail in the Postfix
+queue on a disk that is filling up. Nothing is dropped silently.
+
 | Situation | What happens |
 |---|---|
-| Spool disk has less than 1 GiB free, or a write fails | The capture program exits 75 (temporary failure). Postfix keeps **only the archive copy** in its deferred queue and retries with normal backoff. The console shows "Action needed" and an operational error for each deferral. |
-| Problem persists beyond `maximal_queue_lifetime` (default 5 days) | Postfix gives up on the archive copy only. Because of NOTIFY=NONE nobody is notified, and that message is not archived. Fix disk space well before this. |
-| Console services stopped | Captures accumulate in the spool and are ingested when the collector starts. |
-| Archive limit (`MC_ARCHIVE_MAX_GB`) reached or disk low for the archive | The collector stops moving captures out of the spool and raises an alert. **Nothing is deleted before its retention period.** Raise the limit, add disk or lower retention. |
-| Archive key missing or wrong | Encrypted copies cannot be read. The UI shows an error and `mail-console archive verify` fails. Captures still accumulate safely. |
+| Spool over `--max-spool-mb` (2 GiB), less than `--min-free-mb` (1 GiB) free, or ENOSPC while writing | The capture program reads and discards the message and writes a small `.skipped.json` marker, then exits 0. Postfix completes the queue file normally. The console records "archive copy not stored: <reason>" on that message, adds an operational error, and Monitoring shows **Action needed**. Real recipients are never affected. |
+| Even the skip marker cannot be written (disk completely full) | The copy is lost, but not silently. Postfix logged it as delivered to the archive, and the console flags every such message without an archive or skip record ("delivered by Postfix but no stored copy"). |
+| Unexpected error, bad arguments, missing spool, or the program was removed (rollback to a pre-capture release) | The wrapper `/usr/local/libexec/mail-console/mc-capture` maps every non-zero status to 75 (temporary failure). Postfix keeps only the archive copy deferred and retries; nobody is notified (NOTIFY=NONE). Postfix logs each deferral, and the console reports them. After `maximal_queue_lifetime` (default 5 days) Postfix drops only that copy. |
+| Console services stopped | Captures accumulate in the spool, up to the 2 GiB cap, and are ingested when the collector starts. |
+| Archive limit (`MC_ARCHIVE_MAX_GB`) reached, or the archive disk is low | The collector stops moving captures out of the spool and raises an alert; **nothing is deleted before its retention period**. If this is ignored until the spool cap is reached, new copies are skipped as above. Monitoring warns from 80 % (`MC_ARCHIVE_WARN_PERCENT`). |
+| Encryption key missing while `MC_ARCHIVE_ENCRYPTION=required` (default) | Nothing is stored in plaintext. Captures wait in the spool and an alert is raised. |
+| Hostile or malformed MIME | The raw original is still archived and downloadable; the parse problem is recorded on the archive. A capture that cannot be trusted at all (invalid metadata, symlink, hash mismatch) is moved to `/var/spool/mail-console/quarantine` and never blocks other captures. |
 | Crash during capture | A message counts as captured only after its `.json` is fsynced. Partial files are removed after an hour, and Postfix retries the delivery. |
-| Crash during ingestion | Storing is idempotent: the next pass completes it, removes duplicates or reuses the stored blob. |
+| Crash during ingestion | Archive rows are committed with full fsync before the spool files are removed. The next pass completes the work, de-duplicates it or reuses the verified blob. |
 | Stored file altered or truncated | AES-GCM authentication fails: the UI shows an error instead of content, and `archive verify` reports it. |
 
 ## Deactivation (rollback of the Postfix change)
@@ -167,9 +172,10 @@ To remove everything afterwards:
    sudo postfix check && sudo postfix reload
    ```
 
-Run this before ever uninstalling Mail Console, so that Postfix never tries to
-run a missing capture program. Any archive copies still queued would then be
-dropped silently (NOTIFY=NONE).
+Do this before uninstalling Mail Console. A normal uninstall keeps the
+wrapper `/usr/local/libexec/mail-console/mc-capture`. If capture is still
+active, the wrapper defers copies (exit 75) instead of losing them; `--purge`
+removes it.
 
 ## Verification after activation
 
@@ -208,7 +214,10 @@ submission service, so there the archiving cleanup is attached to port 25.
 | `MC_ARCHIVE_MAX_GB` | 10 | Hard limit for the store; reaching it pauses ingestion, never deletes early |
 | `MC_ARCHIVE_WARN_PERCENT` | 80 | Monitoring turns to "Attention" |
 | `MC_ARCHIVE_MIN_FREE_MB` | 2048 | Collector pauses ingestion below this free space |
-| capture `--min-free-mb` | 1024 | Capture defers (Postfix retries) below this free space on the spool disk |
+| capture `--min-free-mb` | 1024 | Below this free space the copy is skipped with a recorded marker |
+| capture `--max-spool-mb` | 2048 | Spool size at which copies are skipped with a recorded marker |
+| `MC_ARCHIVE_ENCRYPTION` | `required` | `required`: never store plaintext; `off`: allow storing without a key |
+| `MC_ARCHIVE_INDEX_BODY_BYTES` | 2048 | Characters of body text added to the search index per message (0 = none) |
 
 * **Sizing:** the console stores each message once, encrypted, at about its
   original size. For example, 5,000 messages a day at 30 KB average for 90
@@ -234,7 +243,9 @@ submission service, so there the archiving cleanup is attached to port 25.
 - The short-lived spool files are plaintext (`0640`, readable only by the
   console group). They normally exist for under two seconds.
 - The SQLite database (`0600`) contains searchable text (subject, header
-  addresses, attachment names, the first 64 KiB of body text) in plaintext.
+  addresses, attachment names, the first 2,048 characters of body text) in plaintext.
+  When `MC_MAX_DB_MB` is reached, the oldest of these index entries are
+  dropped first; the archived messages stay viewable.
 
 ## Backup and restore
 

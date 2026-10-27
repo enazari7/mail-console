@@ -27,6 +27,7 @@ CHUNK = 64 * 1024
 TAG = 16
 HEADER = struct.Struct(">4s16sIQ")     # magic, salt, chunk size, plaintext size
 KEY_LABEL = b"mail-console archive v1"
+SHA256_RE = __import__("re").compile(r"^[0-9a-f]{64}$")
 
 
 class IntegrityError(Exception):
@@ -72,22 +73,24 @@ class Store:
     def rel_path(self, sha256: str, encrypted: bool) -> str:
         return f"{sha256[:2]}/{sha256[2:4]}/{sha256}{'.enc' if encrypted else ''}"
 
-    def put(self, src: Path, expected_sha256: str) -> tuple[str, int, bool]:
-        """Store ``src`` under its SHA-256. Returns (relative path, stored size, encrypted).
+    def put(self, fin, size: int, expected_sha256: str) -> tuple[str, int, bool]:
+        """Store the content of the open file ``fin`` under its SHA-256.
 
-        The content hash is verified while copying; a mismatch raises
-        IntegrityError and stores nothing.
+        Returns (relative path, stored size, encrypted). The hash is verified
+        while copying; a mismatch raises IntegrityError and stores nothing. An
+        existing blob is reused only if it verifies.
         """
+        if not SHA256_RE.match(expected_sha256):
+            raise IntegrityError("invalid content hash")
         rel = self.rel_path(expected_sha256, self.encrypted)
         final = self.root / rel
-        if final.exists():
+        if final.exists() and self.verify(rel, expected_sha256):
             return rel, final.stat().st_size, self.encrypted
         final.parent.mkdir(parents=True, exist_ok=True, mode=0o750)
         tmp = final.with_name(f".tmp-{final.name}-{secrets.token_hex(4)}")
         digest = hashlib.sha256()
-        size = src.stat().st_size
         try:
-            with open(src, "rb") as fin, open(tmp, "xb") as fout:
+            with open(tmp, "xb") as fout:
                 if self.key is None:
                     while True:
                         data = fin.read(CHUNK)
@@ -108,7 +111,7 @@ class Store:
                 fout.flush()
                 os.fsync(fout.fileno())
             if digest.hexdigest() != expected_sha256:
-                raise IntegrityError(f"content hash mismatch for {src.name}")
+                raise IntegrityError("content hash mismatch")
             os.chmod(tmp, 0o640)
             os.rename(tmp, final)
             dfd = os.open(final.parent, os.O_RDONLY | os.O_DIRECTORY)

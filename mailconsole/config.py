@@ -61,6 +61,13 @@ def _list(name: str, default: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.environ.get(name, default).strip().lower() or default
+    if value not in allowed:
+        raise ConfigError(f"{name}: expected one of {', '.join(allowed)}")
+    return value
+
+
 def _units(name: str, default: str) -> list[tuple[str, str]]:
     """Parse "Label=unit.service,Label2=unit2.service"."""
     units = []
@@ -131,6 +138,8 @@ class Config:
     archive_max_bytes: int = 10 * 1024**3
     archive_warn_percent: int = 80
     archive_min_free_bytes: int = 2 * 1024**3
+    archive_encryption: str = "required"
+    archive_index_body_bytes: int = 2048
 
 
 def load_config() -> Config:
@@ -185,4 +194,6 @@ def load_config() -> Config:
         archive_max_bytes=_int("MC_ARCHIVE_MAX_GB", 10, 1, 100_000) * 1024**3,
         archive_warn_percent=_int("MC_ARCHIVE_WARN_PERCENT", 80, 10, 99),
         archive_min_free_bytes=_int("MC_ARCHIVE_MIN_FREE_MB", 2048, 64) * 1024**2,
+        archive_encryption=_choice("MC_ARCHIVE_ENCRYPTION", "required", ("required", "off")),
+        archive_index_body_bytes=_int("MC_ARCHIVE_INDEX_BODY_BYTES", 2048, 0, 1024 * 1024),
     )

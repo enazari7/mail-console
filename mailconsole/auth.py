@@ -299,7 +299,7 @@ def totp_secret_of(conn: sqlite3.Connection, admin_id: int) -> str | None:
 
 
 def totp_check(conn: sqlite3.Connection, admin_id: int, code: str) -> bool:
-    """Verify a code for an admin and consume its time step (no replay)."""
+    """Verify a code for an admin and consume its time step (no replay, even under concurrency)."""
     row = conn.execute("SELECT totp_secret, totp_last_counter FROM admins WHERE id = ?", (admin_id,)).fetchone()
     if row is None or not row[0]:
         return False
@@ -307,7 +307,61 @@ def totp_check(conn: sqlite3.Connection, admin_id: int, code: str) -> bool:
     if counter is None:
         return False
     with tx(conn):
-        conn.execute("UPDATE admins SET totp_last_counter = ? WHERE id = ?", (counter, admin_id))
+        cur = conn.execute("UPDATE admins SET totp_last_counter = ? WHERE id = ?"
+                           " AND (totp_last_counter IS NULL OR totp_last_counter < ?)", (counter, admin_id, counter))
+    return cur.rowcount == 1
+
+
+TOTP_MAX_FAILURES = 10          # per administrator per WINDOW_US, regardless of client address
+
+
+def _totp_key(admin_id: int) -> str:
+    return _username_key(f"totp-failure:{admin_id}")
+
+
+def totp_allowed(conn: sqlite3.Connection, admin_id: int) -> bool:
+    count = conn.execute("SELECT count(*) FROM login_attempts WHERE username_hash = ? AND success = 0 AND ts >= ?",
+                         (_totp_key(admin_id), now_us() - WINDOW_US)).fetchone()[0]
+    return count < TOTP_MAX_FAILURES
+
+
+def record_totp_failure(conn: sqlite3.Connection, admin_id: int, client_ip: str) -> None:
+    """Counted per administrator; a later correct password does not clear it."""
+    with tx(conn):
+        conn.execute("INSERT INTO login_attempts(ts, client_ip, username_hash, success) VALUES (?, ?, ?, 0)",
+                     (now_us(), f"totp:{client_ip}", _totp_key(admin_id)))
+
+
+def discard_attempt(conn: sqlite3.Connection, attempt_id: int) -> None:
+    """The password was right but a second factor is still required: neither a failure nor a success."""
+    with tx(conn):
+        conn.execute("DELETE FROM login_attempts WHERE id = ?", (attempt_id,))
+
+
+TOTP_SETUP_SECONDS = 600
+
+
+def totp_begin_setup(conn: sqlite3.Connection, admin_id: int) -> str:
+    """Create a pending secret on the server; only it can be confirmed."""
+    from .db import set_setting
+    secret = totp_new_secret()
+    with tx(conn):
+        set_setting(conn, f"totp_pending:{admin_id}", f"{secret}:{now_us() + TOTP_SETUP_SECONDS * 1_000_000}")
+    return secret
+
+
+def totp_confirm_setup(conn: sqlite3.Connection, admin_id: int, code: str) -> bool:
+    from .db import get_setting
+    value = get_setting(conn, f"totp_pending:{admin_id}")
+    if not value:
+        return False
+    secret, _, expires = value.partition(":")
+    if not expires.isdigit() or int(expires) < now_us():
+        return False
+    if not totp_enable(conn, admin_id, secret, code):
+        return False
+    with tx(conn):
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"totp_pending:{admin_id}",))
     return True
 
 

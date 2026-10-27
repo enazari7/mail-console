@@ -30,7 +30,6 @@
       <dl class="meta compact"><dt>Key</dt><dd class="mono wrap">{{ totp_setup.secret }}</dd><dt>URI</dt><dd class="mono wrap small">{{ totp_setup.uri }}</dd></dl>
       <form method="post" action="/settings/totp/enable" class="stack">
         <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
-        <input type="hidden" name="secret" value="{{ totp_setup.secret }}">
         <label>Current code<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required></label>
         <button class="btn primary" type="submit">Enable two-factor authentication</button>
       </form>

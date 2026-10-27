@@ -136,4 +136,7 @@ def test_no_script_changes_postfix():
 
 def test_capture_wrapper_uses_isolated_system_python():
     text = (DEPLOY / "bin" / "mc-capture").read_text()
-    assert "exec /usr/bin/python3 -I /opt/mail-console/current/mailconsole/capture.py" in text
+    assert "/usr/bin/python3 -I \"$SCRIPT\"" in text and "SCRIPT=/opt/mail-console/current/mailconsole/capture.py" in text
+    assert "exit 75" in text and "exec " not in text   # every failure must be a temporary failure for pipe(8)
+    for snippet in ("master.cf.snippet",):
+        assert "argv=/usr/local/libexec/mail-console/mc-capture" in (DEPLOY / "postfix" / snippet).read_text()

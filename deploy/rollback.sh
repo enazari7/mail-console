@@ -14,6 +14,10 @@ CURRENT=$(readlink "$PREFIX/current")
 TARGET=$(cat "$PREFIX/previous" 2>/dev/null || true)
 [ -n "$TARGET" ] && [ -d "$PREFIX/$TARGET" ] || { echo "no previous release recorded" >&2; exit 1; }
 echo "==> rolling back: $CURRENT -> $TARGET"
+if [ -x /usr/local/libexec/mail-console/mc-capture ] && [ ! -e "$PREFIX/$TARGET/mailconsole/capture.py" ]; then
+  echo "warning: $TARGET predates message capture. If Postfix capture is active, archive copies will be" >&2
+  echo "         deferred (not lost) until you roll forward or deactivate capture (docs/MAIL-CAPTURE.md)." >&2
+fi
 
 BACKUP="$DATA_DIR/backups/pre-$(basename "$CURRENT").sqlite3"
 if [ "$RESTORE_DB" -eq 1 ] && [ ! -f "$BACKUP" ]; then

@@ -115,6 +115,9 @@ def cmd_admin(cfg, args) -> int:
                 print(f"no administrator named {args.username!r}", file=sys.stderr)
                 return 1
             auth.totp_disable(conn, row[0])
+            from . import audit
+            audit.record(conn, admin_id=row[0], username=args.username, client_ip="cli", action="totp_disabled",
+                         detail="via mail-console admin totp-disable")
             print(f"two-factor authentication disabled for {args.username!r}")
         elif args.admin_cmd == "unlock":
             print(f"cleared {auth.clear_failures(conn)} failed login attempt(s)")

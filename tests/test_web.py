@@ -238,13 +238,17 @@ def test_totp_enrolment_login_and_replay(client, admin, db, monkeypatch):
     assert login(client).status_code == 303
     token = csrf_from(client.get("/settings").text)
     page = client.post("/settings/totp/setup", data={"csrf_token": token, "password": PASSWORD}).text
-    secret = _re.search(r'name="secret" value="([A-Z2-7]{32})"', page).group(1)
-    assert client.post("/settings/totp/enable", data={"csrf_token": token, "secret": secret,
-                                                      "code": "000000"}).status_code == 400
+    secret = _re.search(r'<dd class="mono wrap">([A-Z2-7]{32})</dd>', page).group(1)
+    assert 'name="secret"' not in page   # the secret stays on the server
+    assert client.post("/settings/totp/enable", data={"csrf_token": token, "code": "000000"}).status_code == 400
+    # A secret supplied by the client is ignored (a stolen session cannot enrol its own key).
+    attacker = _auth.totp_new_secret()
+    assert client.post("/settings/totp/enable", data={"csrf_token": token, "secret": attacker,
+                                                      "code": _auth.totp_now(attacker)}).status_code == 400
     import time as _real_time
     clock = [_real_time.time()]
     monkeypatch.setattr(_auth._time, "time", lambda: clock[0])
-    assert client.post("/settings/totp/enable", data={"csrf_token": token, "secret": secret,
+    assert client.post("/settings/totp/enable", data={"csrf_token": token,
                                                       "code": _auth.totp_now(secret, clock[0])}).status_code == 303
     client.post("/logout", data={"csrf_token": csrf_from(client.get("/settings").text)})
     # Password alone no longer signs in.
@@ -297,3 +301,37 @@ def test_proxied_requests_must_be_https(cfg, app_db, admin):
     r = proxied.get("/login", headers={"x-forwarded-for": "198.51.100.7", "x-forwarded-proto": "https"})
     assert r.status_code == 200 and "max-age" in r.headers["strict-transport-security"]
     assert proxied.get("/login").status_code == 200   # direct loopback (SSH tunnel) still works
+
+
+def test_totp_cannot_be_brute_forced_by_repeating_the_password_step(client, admin, db):
+    from mailconsole import auth as _auth
+    secret = _auth.totp_new_secret()
+    with tx(db):
+        db.execute("UPDATE admins SET totp_secret = ?", (secret,))
+    wrong = "000000" if _auth.totp_now(secret) != "000000" else "111111"
+    guesses = 0
+    for _ in range(10):
+        page = login(client)
+        if page.status_code != 200 or "Authentication code" not in page.text:
+            break
+        for _ in range(_auth.PENDING_LOGIN_ATTEMPTS):
+            r = client.post("/login/totp", data={"code": wrong, "csrf_token": csrf_from(page.text), "next": "/"})
+            if r.status_code != 401:
+                break
+            guesses += 1
+            page = r
+    assert guesses <= _auth.TOTP_MAX_FAILURES
+
+
+def test_totp_code_cannot_be_used_twice_concurrently(db, admin, monkeypatch):
+    from mailconsole import auth as _auth
+    secret = _auth.totp_new_secret()
+    with tx(db):
+        db.execute("UPDATE admins SET totp_secret = ?, totp_last_counter = NULL", (secret,))
+    code = _auth.totp_now(secret)
+    assert _auth.totp_check(db, admin, code)
+    # Second request raced the first: it read the old (empty) last counter, so
+    # its match succeeds; the conditional UPDATE must still refuse it.
+    real = _auth.totp_match
+    monkeypatch.setattr(_auth, "totp_match", lambda s, c, at=None, after_counter=None: real(s, c, at, None))
+    assert not _auth.totp_check(db, admin, code)

@@ -99,6 +99,9 @@ cp "$SRC/requirements.lock" "$SRC/pyproject.toml" "$SRC/README.md" "$DEST/"
 cp -r "$SRC/deploy" "$DEST/"
 install -d -m 0755 "$DEST/bin"
 install -m 0755 "$SRC/deploy/bin/mc-capture" "$DEST/bin/mc-capture"
+# Stable path for Postfix (survives release switches, rollbacks and a normal uninstall).
+install -d -m 0755 /usr/local/libexec/mail-console
+install -m 0755 "$SRC/deploy/bin/mc-capture" /usr/local/libexec/mail-console/mc-capture
 find "$DEST" -name '__pycache__' -prune -exec rm -rf {} +
 "$PYTHON" -m venv "$DEST/venv"
 "$DEST/venv/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir \

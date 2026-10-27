@@ -5,7 +5,6 @@ from __future__ import annotations
 import csv
 import io
 import ipaddress
-import re
 from html import escape as html_escape
 import secrets
 import sqlite3
@@ -21,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, archive, audit, auth, charts, queries
+from . import __version__, archive, audit, auth, charts, mime, queries
 from .config import Config
 from .db import connect, get_setting, now_us, pending_migrations, set_setting, tx
 from .queries import STATUS_HELP, STATUS_LABELS, US
@@ -399,16 +398,22 @@ def create_app(cfg: Config) -> FastAPI:
             admin_id = auth.authenticate(conn, username, password)
         except auth.AuthBusy:
             return fail("The server is busy. Try again in a few seconds.", 429)
-        auth.finish_attempt(conn, attempt, ip, admin_id is not None)
         if admin_id is None:
+            auth.finish_attempt(conn, attempt, ip, False)
             audit.record(conn, admin_id=None, username=None, client_ip=ip, action="login_failed")
             return fail("Invalid username or password.", 401)
         if auth.totp_secret_of(conn, admin_id):
+            # Correct password, second factor pending: neither clear failures nor
+            # mark this address trusted until the code is verified.
+            auth.discard_attempt(conn, attempt)
+            if not auth.totp_allowed(conn, admin_id):
+                return fail("Too many failed authentication codes. Wait 15 minutes and try again.", 429)
             pending = auth.create_pending_login(conn, admin_id, ip)
             response = render(request, conn, "login_totp.html", None, next=_safe_next(next), csrf=new_csrf, error=None)
             set_cookie(response, LOGIN_CSRF_COOKIE, new_csrf, 3600)
             set_cookie(response, PENDING_COOKIE, pending, auth.PENDING_LOGIN_SECONDS)
             return response
+        auth.finish_attempt(conn, attempt, ip, True)
         return start_session(request, conn, admin_id, ip, next)
 
     def start_session(request: Request, conn: sqlite3.Connection, admin_id: int, ip: str, next_url: str) -> Response:
@@ -443,13 +448,17 @@ def create_app(cfg: Config) -> FastAPI:
             response.delete_cookie(PENDING_COOKIE, path="/")
             return response
         token_hash, admin_id = pending
-        if not auth.login_allowed(conn, ip, ""):
+        username = conn.execute("SELECT username FROM admins WHERE id = ?", (admin_id,)).fetchone()[0]
+        if not auth.totp_allowed(conn, admin_id) or not auth.login_allowed(conn, ip, username):
+            auth.finish_pending_login(conn, token_hash)
             return again("Too many failed attempts. Wait 15 minutes and try again.", 429)
         if not auth.totp_check(conn, admin_id, code):
-            auth.record_attempt(conn, ip, f"totp:{admin_id}", False)
-            audit.record(conn, admin_id=admin_id, username=None, client_ip=ip, action="totp_failed")
+            auth.record_totp_failure(conn, admin_id, ip)
+            auth.record_attempt(conn, ip, username, False)
+            audit.record(conn, admin_id=admin_id, username=username, client_ip=ip, action="totp_failed")
             return again("Invalid authentication code.", 401)
         auth.finish_pending_login(conn, token_hash)
+        auth.record_attempt(conn, ip, username, True)
         return start_session(request, conn, admin_id, ip, next)
 
     @app.post("/logout")
@@ -515,6 +524,11 @@ def create_app(cfg: Config) -> FastAPI:
         display = Display(conn)
         flt, rng, state = email_filter(conn, display, request.query_params)
         data = queries.activity(conn, flt, page, display.page_size)
+        if flt.term and page <= 1:
+            # Searches can match archived message bodies: record who searched for what.
+            audit.record(conn, admin_id=session.admin_id, username=session.username,
+                         client_ip=_client_ip(request, cfg), action="search", target=flt.term[:200],
+                         detail=f"{data['total']}{'+' if data['capped'] else ''} rows")
 
         def url(_path: str = "/emails", **changes) -> str:
             merged = {**state, **{k: v for k, v in changes.items()}}
@@ -539,6 +553,9 @@ def create_app(cfg: Config) -> FastAPI:
         display = Display(conn)
         flt, _, _ = email_filter(conn, display, request.query_params)
         truncated = queries.count_rows(conn, flt, EXPORT_MAX_ROWS + 1) > EXPORT_MAX_ROWS
+        audit.record(conn, admin_id=session.admin_id, username=session.username, client_ip=_client_ip(request, cfg),
+                     action="export_csv", target=flt.term[:200] or None,
+                     detail=f"status={flt.status or 'any'} truncated={truncated}")
         stamp = datetime.now(display.tz).strftime("%Y%m%d-%H%M")
         suffix = f"-first-{EXPORT_MAX_ROWS}-rows" if truncated else ""
         headers = {"Content-Disposition": f'attachment; filename="mail-console-emails-{stamp}{suffix}.csv"',
@@ -647,7 +664,7 @@ def create_app(cfg: Config) -> FastAPI:
         part = next((p for p in archive.get_parts(conn, archive_id) if p.index == part_index), None)
         if part is None or part.role in ("container",):
             raise StarletteHTTPException(404, "Attachment not found.")
-        filename = part.filename or f"part-{part_index}.bin"
+        filename = mime.clean_display(part.filename) or f"part-{part_index}.bin"
         ascii_name = "".join(ch if 32 < ord(ch) < 127 and ch not in '"\\;' else "_" for ch in filename)
         audit_access(request, conn, session, "download_attachment", f"archive:{archive_id}/part:{part_index}",
                      filename)
@@ -792,16 +809,18 @@ def create_app(cfg: Config) -> FastAPI:
         failed = verify_password(request, conn, session, password)
         if failed:
             return failed
-        secret = auth.totp_new_secret()
+        secret = auth.totp_begin_setup(conn, session.admin_id)
         ctx = settings_ctx(conn, session)
         ctx["totp_setup"] = {"secret": secret, "uri": auth.totp_uri(secret, session.username)}
         return render(request, conn, "settings.html", session, saved="", error=None, **ctx)
 
     @app.post("/settings/totp/enable")
-    def totp_enable(request: Request, secret: str = Form(""), code: str = Form(""), csrf_token: str = Form(""),
+    def totp_enable(request: Request, code: str = Form(""), csrf_token: str = Form(""),
                     session: auth.Session = Depends(session_dep), conn: sqlite3.Connection = Depends(get_db)):
         check_csrf(session, csrf_token)
-        if not re.fullmatch(r"[A-Z2-7]{32}", secret) or not auth.totp_enable(conn, session.admin_id, secret, code):
+        # The secret comes from the server-side pending setup created after the
+        # password check, never from the form.
+        if not auth.totp_confirm_setup(conn, session.admin_id, code):
             return settings_error(request, conn, session, "The code did not match. Set up two-factor authentication again.")
         auth.delete_other_sessions(conn, session.admin_id, session.token_hash)
         audit.record(conn, admin_id=session.admin_id, username=session.username, client_ip=_client_ip(request, cfg),

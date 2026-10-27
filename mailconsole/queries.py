@@ -409,6 +409,8 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
     if msg["events_truncated"]:
         gaps.append("This message exceeded the per-message event limit; some retry events were not stored, so "
                     "retry counts are lower bounds.")
+    skips = [dict(r) for r in conn.execute(
+        "SELECT captured_ts, reason, size FROM archive_skips WHERE message_id = ? ORDER BY captured_ts", (message_id,))]
     archives = [dict(r) for r in conn.execute(
         "SELECT id, captured_ts, link_method, link_note, sha256, size FROM archives WHERE message_id = ?"
         " ORDER BY captured_ts, id", (message_id,))]
@@ -421,7 +423,7 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
         "dsns": sorted({r["dsn"] for r in recipients if r["dsn"]}),
     }
     return {"message": msg, "recipients": recipients, "events": events, "related": related,
-            "reuse_count": reuse, "reuse_first_ts": reuse_first, "gaps": gaps, "archives": archives,
+            "reuse_count": reuse, "reuse_first_ts": reuse_first, "gaps": gaps, "archives": archives, "skips": skips,
             "summary": summary}
 
 

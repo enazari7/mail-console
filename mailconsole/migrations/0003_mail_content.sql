@@ -37,6 +37,7 @@ CREATE TABLE archives (
     attachment_count    INTEGER NOT NULL DEFAULT 0,
     inline_count        INTEGER NOT NULL DEFAULT 0,
     structure_truncated INTEGER NOT NULL DEFAULT 0,
+    parse_error         TEXT,               -- the raw message is stored even if its MIME structure is unreadable
     message_id          INTEGER REFERENCES messages(id) ON DELETE SET NULL,
     link_method         TEXT NOT NULL DEFAULT 'pending',   -- pending | archive-delivery | queue-lifetime | conflict
     link_note           TEXT,
@@ -47,6 +48,20 @@ CREATE INDEX ix_archives_message ON archives(message_id);
 CREATE INDEX ix_archives_captured ON archives(captured_ts);
 CREATE INDEX ix_archives_pending ON archives(link_method, captured_ts);
 CREATE INDEX ix_archives_sha ON archives(sha256);
+
+-- Copies the capture program deliberately did not store (storage pressure).
+CREATE TABLE archive_skips (
+    id              INTEGER PRIMARY KEY,
+    queue_id        TEXT NOT NULL,
+    captured_ts     INTEGER NOT NULL,
+    reason          TEXT NOT NULL,
+    size            INTEGER,
+    sha256          TEXT,
+    envelope_sender TEXT,
+    message_id      INTEGER REFERENCES messages(id) ON DELETE SET NULL,
+    UNIQUE (queue_id, captured_ts)
+);
+CREATE INDEX ix_archive_skips_message ON archive_skips(message_id);
 
 -- MIME structure with byte offsets into the stored (decrypted) message.
 CREATE TABLE archive_parts (

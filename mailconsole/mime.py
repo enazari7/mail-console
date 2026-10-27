@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import binascii
 import contextlib
+import email.header
 import email.policy
 import email.utils
 from dataclasses import dataclass, field
@@ -20,10 +21,35 @@ from email.parser import BytesHeaderParser
 from typing import BinaryIO, Iterator
 
 MAX_LINE = 64 * 1024            # read granularity for pathological long lines
-MAX_HEADER_BYTES = 512 * 1024   # header blocks larger than this are truncated for parsing
+MAX_HEADER_BYTES = 256 * 1024   # header blocks larger than this are truncated for parsing
+MAX_FIELD_BYTES = 16 * 1024     # each header field is cut to this size before parsing
+MAX_DISPLAY = 4000
 MAX_PARTS = 2000
 MAX_DEPTH = 32
-_header_parser = BytesHeaderParser(policy=email.policy.default)
+# compat32 is the lenient, linear-time parser: structured parsing of hostile
+# headers with policy.default can recurse deeply or take quadratic time.
+_header_parser = BytesHeaderParser(policy=email.policy.compat32)
+BIDI_CONTROLS = dict.fromkeys(map(ord, "\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069\u200e\u200f"), "\ufffd")
+
+
+_CTYPE_RE = __import__("re").compile(r"^[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+$")
+
+
+def clean_display(text: str | None) -> str | None:
+    """Neutralise bidi override characters (spoofed file extensions) for display."""
+    return text.translate(BIDI_CONTROLS) if text else text
+
+
+def decode_header_value(value) -> str | None:
+    """RFC 2047-decode a header value for display; never raises."""
+    if value is None:
+        return None
+    try:
+        text = str(email.header.make_header(email.header.decode_header(str(value))))
+    except Exception:  # noqa: BLE001 - malformed encoded words: show the raw text
+        text = str(value)
+    text = " ".join(text.split())
+    return text[:MAX_DISPLAY]
 
 
 @dataclass
@@ -133,15 +159,23 @@ def scan(fh: BinaryIO) -> Scan:
     def read_headers() -> tuple[int, bytes]:
         start = lines.pos if lines.pushed is None else lines.pushed[0]
         buf = bytearray()
+        field = 0
         while True:
             item = lines.next()
             if item is None:
                 break
-            _, chunk, _ = item
-            if chunk in (b"\n", b"\r\n"):
+            _, chunk, starts_line = item
+            if starts_line and chunk in (b"\n", b"\r\n"):
                 break
-            if len(buf) < MAX_HEADER_BYTES:
-                buf += chunk
+            if starts_line and chunk[:1] not in (b" ", b"\t"):
+                field = 0                      # a new header field begins
+            if field >= MAX_FIELD_BYTES or len(buf) >= MAX_HEADER_BYTES:
+                continue
+            take = chunk[: MAX_FIELD_BYTES - field]
+            if len(take) < len(chunk) and not take.endswith(b"\n"):
+                take += b"\n"
+            buf += take
+            field += len(take)
         return start, bytes(buf)
 
     def entity(parent: int | None, depth: int, boundaries: list[bytes]) -> None:
@@ -154,15 +188,17 @@ def scan(fh: BinaryIO) -> Scan:
         if parent is None:
             result.header_bytes = raw
             for name in ("Subject", "From", "To", "Cc", "Bcc", "Reply-To", "Date", "Message-ID", "Sender"):
-                value = _header_str(msg, name)
+                value = decode_header_value(_header_str(msg, name))
                 if value is not None:
                     result.headers[name] = value
         ctype = (msg.get_content_type() or "text/plain").lower()
+        if len(ctype) > 100 or not _CTYPE_RE.match(ctype):
+            ctype = "application/octet-stream"   # malformed: treat as opaque data
         disposition = filename = None
         with contextlib.suppress(Exception):
             disposition = msg.get_content_disposition()
         with contextlib.suppress(Exception):
-            filename = msg.get_filename()
+            filename = decode_header_value(msg.get_filename())
         cid = _header_str(msg, "Content-ID")
         if cid:
             cid = cid.strip("<> ")
@@ -290,25 +326,48 @@ def iter_range(fh: BinaryIO, start: int, end: int, chunk: int = 64 * 1024) -> It
         yield data
 
 
+_B64_ALPHABET = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+_B64_DELETE = bytes(b for b in range(256) if b not in _B64_ALPHABET)
+
+
+def _b64(data: bytes) -> bytes:
+    data = data.rstrip(b"=")
+    data += b"=" * (-len(data) % 4)
+    try:
+        return binascii.a2b_base64(data)
+    except binascii.Error:
+        return b""
+
+
 def decode_stream(chunks: Iterator[bytes], encoding: str) -> Iterator[bytes]:
     """Decode a Content-Transfer-Encoding incrementally."""
     encoding = (encoding or "7bit").lower()
     if encoding == "base64":
+        # Line-oriented, tolerant decoding: characters outside the alphabet are
+        # dropped, and a padded quantum ends a run (some senders pad each line).
         pending = b""
+        tail = b""
         for data in chunks:
-            pending += data.translate(None, b" \t\r\n")
-            cut = len(pending) - len(pending) % 4
-            if cut:
-                try:
-                    yield binascii.a2b_base64(pending[:cut])
-                except binascii.Error:
-                    yield b""
-                pending = pending[cut:]
+            tail += data
+            lines = tail.split(b"\n")
+            tail = lines.pop()
+            for line in lines:
+                clean = line.translate(None, _B64_DELETE)
+                if not clean:
+                    continue
+                pending += clean
+                if b"=" in clean:
+                    yield _b64(pending)
+                    pending = b""
+                else:
+                    cut = len(pending) - len(pending) % 4
+                    if cut:
+                        yield _b64(pending[:cut])
+                        pending = pending[cut:]
+        clean = tail.translate(None, _B64_DELETE)
+        pending += clean
         if pending:
-            try:
-                yield binascii.a2b_base64(pending + b"=" * (-len(pending) % 4))
-            except binascii.Error:
-                pass
+            yield _b64(pending)
     elif encoding == "quoted-printable":
         pending = b""
         for data in chunks:
@@ -338,6 +397,6 @@ def decode_text(data: bytes, charset: str | None) -> str:
             continue
         try:
             return data.decode(candidate, errors="replace")
-        except LookupError:
+        except (LookupError, UnicodeError, ValueError):   # unknown or unusable codecs (e.g. idna)
             continue
     return data.decode("latin-1", errors="replace")

@@ -119,17 +119,39 @@ def test_capture_defers_on_bad_input(acfg, args):
     assert os.listdir(acfg.archive_spool) == []
 
 
-def test_capture_defers_when_disk_is_low_or_full(acfg, monkeypatch):
+def test_storage_pressure_skips_with_a_marker_instead_of_holding_mail(acfg, monkeypatch):
+    msg = b"Subject: x\n\nbody\n"
+    # Low disk: exit 0 so Postfix finishes the queue file; a marker records the skip.
     rc = capture.main(["--queue-id=ABCDEF1002", f"--spool={acfg.archive_spool}", "--min-free-mb=99999999"],
-                      stdin=io.BytesIO(b"Subject: x\n\nbody\n"))
-    assert rc == capture.EX_TEMPFAIL and os.listdir(acfg.archive_spool) == []
+                      stdin=io.BytesIO(msg))
+    names = os.listdir(acfg.archive_spool)
+    assert rc == 0 and len(names) == 1 and names[0].endswith(".skipped.json")
+    marker = json.loads((acfg.archive_spool / names[0]).read_text())
+    assert marker["queue_id"] == "ABCDEF1002" and marker["size"] == len(msg) and "free disk" in marker["skipped"]
+    (acfg.archive_spool / names[0]).unlink()
+    # Spool over its cap (the console is not ingesting).
+    (acfg.archive_spool / "100-ABCDEF0000-aaaaaaaa.eml").write_bytes(b"x" * 2 * 1024 * 1024)
+    rc = capture.main(["--queue-id=ABCDEF1003", f"--spool={acfg.archive_spool}", "--min-free-mb=0",
+                       "--max-spool-mb=1"], stdin=io.BytesIO(msg))
+    assert rc == 0 and any(n.endswith(".skipped.json") for n in os.listdir(acfg.archive_spool))
+    for n in os.listdir(acfg.archive_spool):
+        (acfg.archive_spool / n).unlink()
 
+    # ENOSPC while writing (even the marker cannot be written): still exit 0, no partial files.
     def enospc(fd, data):
         raise OSError(errno.ENOSPC, "No space left on device")
     monkeypatch.setattr(capture.os, "write", enospc)
-    rc = capture.main(["--queue-id=ABCDEF1003", f"--spool={acfg.archive_spool}", "--min-free-mb=0"],
-                      stdin=io.BytesIO(b"Subject: x\n\nbody\n"))
-    assert rc == capture.EX_TEMPFAIL and os.listdir(acfg.archive_spool) == []
+    rc = capture.main(["--queue-id=ABCDEF1004", f"--spool={acfg.archive_spool}", "--min-free-mb=0"],
+                      stdin=io.BytesIO(msg))
+    assert rc == 0 and os.listdir(acfg.archive_spool) == []
+
+
+def test_wrapper_maps_every_failure_to_tempfail():
+    import subprocess
+    from pathlib import Path
+    wrapper = Path(__file__).resolve().parent.parent / "deploy" / "bin" / "mc-capture"
+    r = subprocess.run(["sh", str(wrapper), "--queue-id=ABCDEF1005"], input=b"x", capture_output=True)
+    assert r.returncode == 75   # the capture program is not installed here: deferred, never dropped
 
 
 def test_capture_is_stdlib_only():
@@ -137,7 +159,7 @@ def test_capture_is_stdlib_only():
     tree = ast.parse(open(capture.__file__).read())
     imported = {n.names[0].name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)}
     imported |= {n.module.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
-    assert not imported - {"__future__", "argparse", "hashlib", "json", "os", "re", "secrets", "socket", "sys",
+    assert not imported - {"__future__", "argparse", "errno", "hashlib", "json", "os", "re", "secrets", "socket", "sys",
                            "time"}
 
 
@@ -150,7 +172,8 @@ def test_encrypted_store_roundtrip_random_access_and_tamper(tmp_path):
     import hashlib
     sha = hashlib.sha256(data).hexdigest()
     store = blobstore.Store(tmp_path / "store", bytes(32))
-    rel, size, encrypted = store.put(src, sha)
+    with open(src, "rb") as fh:
+        rel, size, encrypted = store.put(fh, len(data), sha)
     assert encrypted and rel.endswith(".enc") and data[:4096] not in (tmp_path / "store" / rel).read_bytes()
     with store.open(rel) as fh:
         fh.seek(200_000)
@@ -163,8 +186,10 @@ def test_encrypted_store_roundtrip_random_access_and_tamper(tmp_path):
     assert not store.verify(rel, sha)
     path.write_bytes(bytes(raw[:-100]))   # truncation
     assert not store.verify(rel, sha)
-    with pytest.raises(blobstore.IntegrityError):
-        store.put(src, "0" * 64)         # wrong hash is refused
+    with pytest.raises(blobstore.IntegrityError), open(src, "rb") as fh:
+        store.put(fh, len(data), "0" * 64)         # wrong hash is refused
+    with pytest.raises(blobstore.IntegrityError), open(src, "rb") as fh:
+        store.put(fh, len(data), "../../etc/passwd")   # never a path
 
 
 # --- ingestion, correlation, recipients ---------------------------------------------
@@ -466,3 +491,121 @@ def test_mime_scanner_handles_rfc2047_and_lf(tmp_path):
     assert roles.count("attachment") == 2 and "body-html" in roles and "inline" in roles
     assert any(p.filename == "فاکتور ۱۲.pdf" for p in s.parts)
     assert re.search(r"verification", s.headers["Subject"])
+
+
+# --- review regressions ------------------------------------------------------------
+
+def test_hostile_mime_is_archived_raw_and_never_blocks_ingestion(db, acfg, store):
+    hostile = b"Content-Type: text/plain " + b"(" * 30000 + b"\nSubject: hostile\n\nbody\n"
+    idna = b"Subject: idna\nContent-Type: text/plain; charset=idna\n\nbody\n"
+    for i, data in enumerate((hostile, idna, make_message())):
+        spool_capture(acfg, data, f"ABCDEF20{i:02d}", us(f"2026-10-22T10:00:0{i}.000000"))
+    stats = archive.process_spool(db, acfg, store)
+    assert stats.ingested == 3 and stats.quarantined == 0 and os.listdir(acfg.archive_spool) == []
+    row = db.execute("SELECT * FROM archives WHERE queue_id = 'ABCDEF2000'").fetchone()
+    assert row["subject"] == "hostile"
+    a = archive.get_archive(db, row["id"])
+    assert b"".join(archive.stream_raw(store, a)) == hostile
+
+
+def test_untrusted_spool_entries_are_quarantined(db, acfg, store, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("console-only data")
+    spool_capture(acfg, make_message(), "ABCDEF2100", us("2026-10-22T10:00:05.000000"))
+    # A symlinked .eml (planted by a compromised capture user) and invalid metadata.
+    (acfg.archive_spool / "1700000000000000-ABCDEF2101-aaaaaaaa.eml").symlink_to(secret)
+    (acfg.archive_spool / "1700000000000000-ABCDEF2101-aaaaaaaa.json").write_text(json.dumps(
+        {"queue_id": "ABCDEF2101", "sha256": "a" * 64, "size": 17, "captured_us": 1}))
+    (acfg.archive_spool / "1700000000000001-ABCDEF2102-bbbbbbbb.json").write_text(json.dumps(
+        {"queue_id": "ABCDEF2102", "sha256": "../../../x", "size": 1, "captured_us": 1}))
+    (acfg.archive_spool / "1700000000000001-ABCDEF2102-bbbbbbbb.eml").write_bytes(b"x")
+    stats = archive.process_spool(db, acfg, store)
+    assert stats.ingested == 1 and stats.quarantined == 2
+    assert secret.read_text() == "console-only data"
+    assert len(os.listdir(acfg.archive_spool.parent / "quarantine")) == 4
+
+
+def test_skip_marker_is_recorded_and_shown(db, acfg, store, admin_client_factory):
+    capture.main(["--queue-id=ABCDEF2200", f"--spool={acfg.archive_spool}", "--min-free-mb=99999999"],
+                 stdin=io.BytesIO(make_message()))
+    name = os.listdir(acfg.archive_spool)[0]
+    marker = json.loads((acfg.archive_spool / name).read_text())
+    marker["captured_us"] = us("2026-10-22T10:00:00.200000")
+    (acfg.archive_spool / name).write_text(json.dumps(marker))
+    ingest_lines(db, acfg, log_lines("ABCDEF2200", "2026-10-22T10:00:00"))
+    stats = archive.process_spool(db, acfg, store)
+    archive.relink(db, stats.queue_ids)
+    skip = db.execute("SELECT * FROM archive_skips").fetchone()
+    mid = db.execute("SELECT id FROM messages WHERE queue_id = 'ABCDEF2200'").fetchone()[0]
+    assert skip["message_id"] == mid and os.listdir(acfg.archive_spool) == []
+    assert db.execute("SELECT count(*) FROM ops_events WHERE message LIKE '%ABCDEF2200 was NOT archived%'"
+                      ).fetchone()[0] == 1
+    page = admin_client_factory(acfg).get(f"/emails/{mid}").text
+    assert "was not stored" in page and "free disk" in page
+
+
+def test_missing_copy_is_detected(db, acfg):
+    from datetime import datetime, timedelta, timezone
+    hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    ingest_lines(db, acfg, log_lines("ABCDEF2300", hour_ago))
+    st = archive.status(db, acfg)
+    assert st["missing_7d"] == 1 and st["level"] == "critical"
+
+
+def test_encryption_required_fails_closed(db, acfg):
+    acfg.archive_key_file.unlink()
+    plain_store = archive.open_store(acfg)
+    spool_capture(acfg, make_message(), "ABCDEF2400", us("2026-10-22T10:00:00.200000"))
+    stats = archive.process_spool(db, acfg, plain_store)
+    assert stats.blocked and "key" in stats.blocked and len(os.listdir(acfg.archive_spool)) == 2
+    off = dataclasses.replace(acfg, archive_encryption="off")
+    assert archive.process_spool(db, off, plain_store).ingested == 1
+
+
+def test_correlation_ignores_previous_lifetime_archive_delivery(db, acfg, store):
+    # Same short Queue ID, two lifetimes 30 s apart, copies without Message-ID headers.
+    ingest_lines(db, acfg, log_lines("ABCDEF2500", "2026-10-22T10:00:00", None)
+                 + log_lines("ABCDEF2500", "2026-10-22T10:00:30", None))
+    spool_capture(acfg, make_message(None, "Second", attachments=False), "ABCDEF2500",
+                  us("2026-10-22T10:00:30.200000"))
+    ingest_all(db, acfg, store)
+    second = db.execute("SELECT id FROM messages WHERE queue_id = 'ABCDEF2500' ORDER BY first_ts DESC").fetchone()[0]
+    assert db.execute("SELECT message_id FROM archives").fetchone()[0] == second
+
+
+def test_preview_strips_any_meta_and_filenames_lose_bidi_controls(db, acfg, store, admin_client_factory):
+    m = EmailMessage()
+    m["Subject"] = "meta"
+    m.set_content("x")
+    m.add_alternative('<meta data-x=">" http-equiv=refresh content="0;url=https://evil.example/"><p>hi</p>',
+                      subtype="html")
+    m.add_attachment(b"MZ", maintype="application", subtype="octet-stream", filename="invoice‮fdp.exe")
+    spool_capture(acfg, m.as_bytes(), "ABCDEF2600", us("2026-10-22T10:00:00.200000"))
+    ingest_all(db, acfg, store)
+    client = admin_client_factory(acfg)
+    body = client.get("/archives/1/preview.html").text
+    assert "evil.example" not in body and "<p>hi</p>" in body
+    part = next(p for p in archive.get_parts(db, 1) if p.filename)
+    disp = client.get(f"/archives/1/parts/{part.index}").headers["content-disposition"]
+    assert "‮" not in disp and "%E2%80%AE" not in disp
+
+
+def test_size_cap_drops_content_index_before_history(db, acfg, store, monkeypatch):
+    from mailconsole import collector as col
+    spool_capture(acfg, make_message(), "ABCDEF2700", us("2026-10-22T10:00:00.200000"))
+    ingest_lines(db, acfg, log_lines("ABCDEF2700", "2026-10-22T10:00:00"))
+    ingest_all(db, acfg, store)
+    sizes = iter([10**12, 0, 0, 0])
+    monkeypatch.setattr(col, "live_db_bytes", lambda conn: next(sizes, 0))
+    result = col.apply_retention(db, dataclasses.replace(acfg, max_db_mb=16), now=us("2026-10-23T00:00:00.000000"))
+    assert result["size_cap_unindexed"] == 1 and result["size_cap_trimmed"] == 0
+    assert db.execute("SELECT count(*) FROM messages").fetchone()[0] == 1
+
+
+def test_mime_tolerates_padded_lines_and_exact_64k_header_lines():
+    import base64
+    data = os.urandom(300)
+    perline = b"\n".join(base64.b64encode(data[i:i + 3]) for i in range(0, 300, 3))
+    assert b"".join(mime.decode_stream(iter([perline]), "base64")) == data
+    long_line = b"X-Long: " + b"a" * (65536 - 8) + b"\nContent-Type: text/html\n\n<b>x</b>\n"
+    assert mime.scan(io.BytesIO(long_line)).parts[0].content_type == "text/html"

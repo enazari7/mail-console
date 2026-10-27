@@ -62,6 +62,9 @@
   {% elif not ar.spool_exists and not ar.archives %}<p class="muted">Not set up yet: the capture spool does not exist. See docs/MAIL-CAPTURE.md.</p>
   {% else %}
   {% if ar.blocked and ar.blocked[0] %}<div class="banner error">{{ ar.blocked[0] }}</div>{% endif %}
+  {% if ar.key_missing %}<div class="banner error">The archive encryption key is missing; captures wait in the spool and are not stored.</div>{% endif %}
+  {% if ar.skipped_7d %}<div class="banner error">{{ ar.skipped_7d }} cop{{ "y was" if ar.skipped_7d == 1 else "ies were" }} not archived in the last 7 days because of storage pressure (see Recent operational errors). Mail delivery was not affected.</div>{% endif %}
+  {% if ar.missing_7d %}<div class="banner error">{{ ar.missing_7d }} message{{ "" if ar.missing_7d == 1 else "s" }} in the last 7 days had an archive copy delivered by Postfix but no stored copy or skip record (disk was likely full).</div>{% endif %}
   {% if ar.deferred_copies %}<div class="banner error">{{ ar.deferred_copies }} archive cop{{ "y is" if ar.deferred_copies == 1 else "ies are" }} deferred by Postfix (real recipients are unaffected). See Recent operational errors.</div>{% endif %}
   <dl class="meta">
     <dt>Archived messages</dt><dd>{{ "{:,}".format(ar.archives) }}{% if ar.last_capture_ts %} · last capture {{ ago(ar.last_capture_ts) }}{% endif %}</dd>

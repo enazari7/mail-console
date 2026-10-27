@@ -13,8 +13,8 @@ WARN=0; FAIL=0
 command -v postconf >/dev/null || { echo "postconf not found"; exit 1; }
 
 ok "Postfix $(postconf -h mail_version)"
-[ -x /opt/mail-console/current/bin/mc-capture ] && ok "capture entry point installed" \
-  || fail "/opt/mail-console/current/bin/mc-capture missing (install or update Mail Console first)"
+[ -x /usr/local/libexec/mail-console/mc-capture ] && ok "capture entry point installed" \
+  || fail "/usr/local/libexec/mail-console/mc-capture missing (install or update Mail Console first)"
 id -u mcarchive >/dev/null 2>&1 && ok "capture user mcarchive exists" || fail "user mcarchive missing (run install.sh)"
 if [ -d "$SPOOL" ]; then
   ok "spool $SPOOL ($(stat -c '%a %U:%G' "$SPOOL"))"
@@ -28,7 +28,7 @@ fi
 
 # Capture program dry run into a throw-away directory as the capture user.
 TMP=$(mktemp -d); chown mcarchive "$TMP"
-if printf 'Subject: preflight\n\npreflight\n' | runuser -u mcarchive -- /opt/mail-console/current/bin/mc-capture \
+if printf 'Subject: preflight\n\npreflight\n' | runuser -u mcarchive -- /usr/local/libexec/mail-console/mc-capture \
      --queue-id=PREFLIGHT01 --sender=preflight@example.invalid --spool="$TMP" --min-free-mb=1; then
   [ -n "$(ls "$TMP"/*.json 2>/dev/null)" ] && ok "capture program works as mcarchive" || fail "capture wrote no files"
 else

@@ -152,7 +152,7 @@ jobs:
                            "mailconsole-archive_destination_recipient_limit = 1"
           sudo postconf -M "cleanup-archive/unix=cleanup-archive unix n - y - 0 cleanup"
           sudo postconf -P "cleanup-archive/unix/always_bcc=archive@mail-console.invalid"
-          sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/opt/mail-console/current/bin/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
+          sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/usr/local/libexec/mail-console/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
           sudo postconf -P "smtp/inet/cleanup_service_name=cleanup-archive"
           sudo postfix check
           sudo systemctl restart postfix
