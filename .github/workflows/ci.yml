@@ -235,6 +235,9 @@ jobs:
         run: |
           sudo python3 -I deploy/capture_postfix.py deactivate
           sudo postfix reload
+          sudo python3 -I deploy/capture_postfix.py status
+          sudo python3 -I deploy/capture_postfix.py deactivate --finish
+          sudo postfix reload
           sudo postconf -n | diff /tmp/n.before -
           sudo postconf -M | diff /tmp/M.before -
           sudo postconf -P | diff /tmp/P.before -

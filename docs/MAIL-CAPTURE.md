@@ -98,8 +98,10 @@ never called by install, update, rollback or uninstall. What it does:
    (`smtpd_sasl_auth_enable=yes`) submission listener. If there is none, or
    more than one, it **refuses** and asks for `--listener NAME`. It refuses a
    name that does not exist (it never creates a generic `submission`
-   service) and refuses listeners without SMTP AUTH (port 25 inbound is
-   never captured).
+   service), listeners without SMTP AUTH, and non-submission ports such as
+   25, so inbound mail is never captured. It also refuses when an
+   `always_bcc` is already in use, because that copy would otherwise be
+   replaced, and when `trivial-rewrite` has its own `transport_maps`.
 2. **Mirrors the cleanup service** the listener uses today. On Ubuntu that is
    `cleanup unix n - y - 0 cleanup`: chroot `y`, plus any `-o` options it
    has. `cleanup-archive` becomes an exact copy with only its name changed,
@@ -203,27 +205,37 @@ queue on a disk that is filling up. Nothing is dropped silently.
 
 ## Deactivation (rollback of the Postfix change)
 
+Deactivation has two phases. This way copies already in the queue still reach
+the archive transport, and never follow a default or relay route:
+
 ```bash
+# Phase 1: listeners get back their exact previous cleanup_service_name. No new copies after the reload.
 sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py deactivate
+sudo postfix reload
+
+# Wait until no queued message still carries the archive copy (normally immediately)
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py status
+
+# Phase 2: remove the archive route, the two services and the map
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py deactivate --finish
 sudo postfix reload
 ```
 
-`deactivate` restores every value recorded at `apply` exactly:
-
-- the listener's previous `cleanup_service_name`, or its absence; a value that
-  existed before is put back, never just removed;
-- `transport_maps` and the recipient limit, set again to their old values or
-  removed if they were not set;
-- the two services removed;
-- the map file removed if Mail Console created it.
-
-It then checks that the listener options equal the recorded ones.
-
-- **Test coverage:** CI compares `postconf -n`, `postconf -M` and
-  `postconf -P` before `apply` and after `deactivate`, and they are identical.
-- **Timing and backups:** deactivation affects new mail immediately and leaves
-  queued mail alone. The backups under `/var/backups/mail-console-postfix/`
-  stay for reference.
+* **`--finish` refuses** while `postqueue -j` shows any queued message with
+  the archive recipient.
+* **Only Mail Console's own changes are removed**, from the *current*
+  configuration:
+  - the `mailconsole_transport` entry is removed from `transport_maps`; maps
+    added by an administrator after `apply` (for example for the bounce
+    collector) stay;
+  - the recipient limit is reset only if it still has Mail Console's value;
+  - a map file that existed before `apply` is written back.
+* **Manual listener edits:** if the listener was edited by hand in between,
+  `deactivate` restores `cleanup_service_name`, reports the other edits as
+  warnings and leaves them alone.
+* **Tested exact restore:** without later edits the result is identical to
+  the pre-`apply` configuration. CI compares `postconf -n`, `postconf -M` and
+  `postconf -P` before `apply` and after `deactivate --finish`.
 
 Do this before uninstalling Mail Console or rolling back to a release
 without capture. If capture is still active then:
@@ -253,10 +265,14 @@ without capture. If capture is still active then:
    postqueue -p
    ```
 
-CI performs this full sequence against a real Postfix 3.8 on Ubuntu 24.04,
-x86-64 and ARM64 (`capture-e2e` job). It includes deactivation, which shows
-that new mail stops being captured while delivery continues. CI has no SASL
-submission service, so there the archiving cleanup is attached to port 25.
+CI runs this whole sequence on x86-64 and ARM64 (`capture-e2e` job). It uses
+a real Postfix 3.8 on Ubuntu 24.04 with the production listener layout: a
+public and a loopback named submission listener, Dovecot SASL, required TLS
+and milter options. It checks that:
+
+- the public listener is archived and the loopback listener is not;
+- a broken capture defers only the archive copy, with no bounce;
+- deactivation restores the configuration exactly.
 
 ## Storage, retention and limits
 
@@ -276,9 +292,9 @@ submission service, so there the archiving cleanup is attached to port 25.
 
 * **Sizing:** the console stores each message once, encrypted, at about its
   original size. For example, 5,000 messages a day at 30 KB average for 90
-  days is about 13 GB, so raise `MC_ARCHIVE_MAX_GB` accordingly. The server
-  has 38 GB; keep `maximal_queue_lifetime` worth of headroom for the Postfix
-  queue.
+  days is about 13 GB. That is more than the 8 GB budget recommended below for
+  this 38 GB server, so shorten archive retention instead. See *Disk capacity*
+  below.
 * **Large messages:** large messages and attachments are streamed. Nothing
   loads a whole message into memory: tested with a 16 MiB message peaking
   under 8 MiB of Python memory.
@@ -292,7 +308,7 @@ queue, the console database, the archive and the capture spool.
 |---|---|---|
 | Ubuntu 24.04, packages, BeastPing app, caches | 6–8 GB | measure with `df -h /` before activation |
 | `/var/log` (rsyslog rotation, journald) | 1–3 GB | `journalctl --disk-usage`; cap with `SystemMaxUse=` if large |
-| **Postfix queue headroom** | **≥ 4 GB kept free** | covers a destination outage (deferred mail) and Postfix's own free-space check: smtpd defers new mail when free space drops below `queue_minfree` (at least 1.5 × `message_size_limit`) |
+| **Postfix queue headroom** | **≥ 4 GB kept free** (deferred archive copies hold their whole queue file: 20,000/day × 40 KB × 5 days ≈ 4 GB in the worst case) | covers a destination outage (deferred mail) and Postfix's own free-space check: smtpd defers new mail when free space drops below `queue_minfree` (at least 1.5 × `message_size_limit`) |
 | Capture spool | ≤ 2 GB (`--max-spool-mb`) | normally empty; fills only while the console is not ingesting |
 | Console database | `MC_MAX_DB_MB` | ~5 KB per logged message + ~10 KB per archived message (search index of 2,048 body chars) |
 | Archive store | `MC_ARCHIVE_MAX_GB` | ≈ message size per archived message (encryption adds 0.03 %) |
@@ -307,8 +323,11 @@ queue, the console database, the archive and the capture spool.
   ```
 * **Recommended budget** (these are the defaults of this release; an existing
   `/etc/mail-console/mail-console.env` keeps its own values, so set them there).
-  About 12–14 GB in total for Mail Console, which
-  leaves about 15 GB free for the OS, logs and Postfix queue:
+  About 12–14 GB in total for Mail Console. From 38 GB that leaves about 24 GB.
+  The OS and packages (6–8 GB) and logs (1–3 GB) use part of it, so roughly
+  13–17 GB stays free as Postfix queue headroom and safety margin. Note that
+  ext4 reserves 5 % (about 1.9 GB) for root, which the `mcarchive` and
+  `postfix` users cannot use.
   - `MC_ARCHIVE_MAX_GB=8`;
   - `MC_MAX_DB_MB=3072`;
   - spool cap 2 GB;
@@ -320,8 +339,12 @@ queue, the console database, the archive and the capture spool.
   | Messages/day | Archive per day | Archive retention that fits 8 GB | Log retention that fits 3 GB DB |
   |---|---|---|---|
   | 1,000 | 40 MB | 180 days | 90 days or more |
-  | 5,000 | 200 MB | 30–40 days | 60 days |
-  | 20,000 | 800 MB | 7–10 days | 14–21 days (or `MC_ARCHIVE_INDEX_BODY_BYTES=512`) |
+  | 5,000 | 200 MB | 30–40 days | ~40 days |
+  | 20,000 | 800 MB | 7–10 days | 10–14 days (or `MC_ARCHIVE_INDEX_BODY_BYTES=512`) |
+
+  Database estimate: about 5 KB per logged message, plus about 10 KB per
+  archived message while its search index is kept. At 5,000 messages a day,
+  40 days of history with a 35-day archive is about 2.8 GB.
 
 * **Alerts:**
   - Monitoring turns **Attention** at 80 % of `MC_ARCHIVE_MAX_GB` and

@@ -7,7 +7,9 @@ update, rollback and uninstall scripts never call it.
     sudo python3 -I capture_postfix.py plan                 # read-only
     sudo python3 -I capture_postfix.py apply [--listener NAME] [--yes]
     sudo postfix reload                                     # activates
-    sudo python3 -I capture_postfix.py deactivate          # exact restore
+    sudo python3 -I capture_postfix.py deactivate          # listeners restored
+    sudo postfix reload                                     # no new archive copies
+    sudo python3 -I capture_postfix.py deactivate --finish # once no copy is queued
     sudo postfix reload
     sudo python3 -I capture_postfix.py status
 
@@ -111,8 +113,32 @@ class Postfix:
     def main_value(self, name: str) -> str:
         return self._run(self.postconf, "-h", name).strip()
 
+    def main_expanded(self, name: str) -> str:
+        """Value with $parameter references expanded (postconf -x)."""
+        return self._run(self.postconf, "-xh", name).strip()
+
     def main_explicit(self) -> str:
         return self._run(self.postconf, "-n")
+
+    def archive_copies_queued(self) -> int:
+        """Queued messages that still carry the archive recipient."""
+        out = self._run("/usr/sbin/postqueue", "-j")
+        count = 0
+        for line in out.splitlines():
+            try:
+                item = json.loads(line)
+            except ValueError:
+                continue
+            if any(r.get("address", "").lower() == ARCHIVE_ADDRESS for r in item.get("recipients", [])):
+                count += 1
+        return count
+
+    def read_map(self) -> str | None:
+        try:
+            with open(MAP_FILE) as fh:
+                return fh.read()
+        except FileNotFoundError:
+            return None
 
     def query(self, table: str, key: str) -> str | None:
         proc = subprocess.run([self.postmap, "-q", key, table], capture_output=True, text=True, timeout=30)
@@ -193,7 +219,8 @@ def is_authenticated(svc: Service, global_sasl: str) -> bool:
     return svc.params.get("smtpd_sasl_auth_enable", global_sasl).strip().lower() == "yes"
 
 
-def choose_listeners(services: dict, global_sasl: str, requested: list[str]) -> list[Service]:
+def choose_listeners(services: dict, global_sasl: str, requested: list[str],
+                     allow_other_port: bool = False) -> list[Service]:
     listeners = smtpd_listeners(services)
     by_name = {s.name: s for s in listeners}
     if requested:
@@ -206,6 +233,9 @@ def choose_listeners(services: dict, global_sasl: str, requested: list[str]) -> 
             if not is_authenticated(svc, global_sasl):
                 raise PlanError(f"--listener {name} does not require SMTP AUTH; capturing it could archive "
                                 "unrelated inbound mail. Refusing.")
+            if svc.port not in SUBMISSION_PORTS and not allow_other_port:
+                raise PlanError(f"--listener {name} is not a submission port ({svc.port}); SASL being enabled does "
+                                "not mean it is required there, so inbound mail could be archived. Refusing.")
             chosen.append(svc)
         return chosen
     candidates = [s for s in listeners
@@ -221,9 +251,9 @@ def choose_listeners(services: dict, global_sasl: str, requested: list[str]) -> 
     return candidates
 
 
-def base_cleanup(services: dict, listeners: list[Service]) -> Service:
+def base_cleanup(services: dict, listeners: list[Service], default: str = "cleanup") -> Service:
     """The cleanup service the listeners use today (cleanup-archive copies it)."""
-    names = {s.params.get("cleanup_service_name", "cleanup") for s in listeners}
+    names = {s.params.get("cleanup_service_name", default) for s in listeners}
     if len(names) != 1:
         raise PlanError(f"the selected listeners use different cleanup services ({', '.join(sorted(names))}); "
                         "configure them one at a time")
@@ -257,6 +287,7 @@ class Plan:
     transport_maps_before: str
     transport_maps_after: str
     services: dict
+    warnings: list[str] = field(default_factory=list)
 
     def commands(self) -> list[str]:
         cmds = [
@@ -273,15 +304,31 @@ class Plan:
         return cmds
 
 
-def make_plan(pf, requested: list[str]) -> Plan:
+def make_plan(pf, requested: list[str], allow_other_port: bool = False) -> Plan:
     services = parse_services(pf.master_lines(), pf.service_params())
     for name in (ARCHIVE_SERVICE, PIPE_SERVICE):
         if (name, "unix") in services:
             raise PlanError(f"{name}/unix already exists in master.cf; run 'status' or 'deactivate' first")
-    listeners = choose_listeners(services, pf.main_value("smtpd_sasl_auth_enable"), requested)
-    base = base_cleanup(services, listeners)
+    listeners = choose_listeners(services, pf.main_value("smtpd_sasl_auth_enable"), requested, allow_other_port)
+    base = base_cleanup(services, listeners, pf.main_value("cleanup_service_name") or "cleanup")
+    # An existing always_bcc (compliance copy) would be replaced for submitted mail.
+    if pf.main_value("always_bcc") or base.params.get("always_bcc"):
+        raise PlanError("always_bcc is already in use (main.cf or the base cleanup service); the archive copy "
+                        "would replace it. Use sender_bcc_maps for capture instead, or remove always_bcc first.")
+    for svc in services.values():
+        if svc.command == "trivial-rewrite" and "transport_maps" in svc.params:
+            raise PlanError(f"{svc.name}/{svc.type} overrides transport_maps; the archive route would not be "
+                            "seen there. Adjust the plan by hand.")
     current_maps = pf.main_value("transport_maps")
-    return Plan(listeners, base, archive_cleanup_line(base), current_maps, new_transport_maps(current_maps), services)
+    plan = Plan(listeners, base, archive_cleanup_line(base), current_maps, new_transport_maps(current_maps), services)
+    relay = pf.main_value("relayhost")
+    default_transport = pf.main_value("default_transport")
+    if relay or default_transport not in ("", "smtp"):
+        plan.warnings.append(
+            f"mail without a specific route goes to relayhost={relay or '-'} / default_transport="
+            f"{default_transport}. The archive copy is always routed by the first transport map entry, and "
+            "'deactivate --finish' refuses to remove that route while archive copies are still queued.")
+    return plan
 
 
 def describe(pf, plan: Plan, out=sys.stdout) -> None:
@@ -293,6 +340,8 @@ def describe(pf, plan: Plan, out=sys.stdout) -> None:
     print(f"base cleanup: {plan.base.name}/unix columns={' '.join(plan.base.fields)}", file=out)
     print(f"transport_maps: {plan.transport_maps_before or '(empty)'}", file=out)
     print(f"            ->  {plan.transport_maps_after}", file=out)
+    for warning in plan.warnings:
+        print(f"note: {warning}", file=out)
     print("commands:", file=out)
     for cmd in plan.commands():
         print(f"  {cmd}", file=out)
@@ -326,7 +375,7 @@ def verify(pf, state: dict) -> list[str]:
     if (PIPE_SERVICE, "unix") not in services:
         problems.append(f"{PIPE_SERVICE}/unix missing")
     # The archive address must resolve to the internal pipe transport, first.
-    maps = [m for m in re.split(r"[\s,]+", pf.main_value("transport_maps")) if m]
+    maps = [m for m in re.split(r"[\s,]+", pf.main_expanded("transport_maps")) if m]
     first_hit = None
     for table in maps:
         hit = pf.query(table, ARCHIVE_ADDRESS)
@@ -335,11 +384,13 @@ def verify(pf, state: dict) -> list[str]:
             break
     if first_hit is None or first_hit[1].strip() != f"{PIPE_SERVICE}:":
         problems.append(f"{ARCHIVE_ADDRESS} does not resolve to {PIPE_SERVICE}: first (got {first_hit})")
+    archive_params = archive.params if archive is not None else {}
     for param in ("virtual_alias_maps", "canonical_maps", "recipient_canonical_maps"):
-        for table in [m for m in re.split(r"[\s,]+", pf.main_value(param)) if m and ":" in m]:
+        value = archive_params.get(param) or pf.main_expanded(param)   # cleanup-archive -o override wins
+        for table in [m for m in re.split(r"[\s,]+", value) if m and ":" in m]:
             if pf.query(table, ARCHIVE_ADDRESS) is not None:
                 problems.append(f"{param} {table} rewrites {ARCHIVE_ADDRESS}")
-    domains = " ".join(pf.main_value(p) for p in ("mydestination", "virtual_mailbox_domains", "virtual_alias_domains",
+    domains = " ".join(pf.main_expanded(p) for p in ("mydestination", "virtual_mailbox_domains", "virtual_alias_domains",
                                                    "relay_domains"))
     if "mail-console.invalid" in domains:
         problems.append("mail-console.invalid is listed as a local/virtual/relay domain")
@@ -366,6 +417,8 @@ def apply(pf, plan: Plan, state_file: str = STATE_FILE, backup_root: str = BACKU
         "limit_explicit": LIMIT_PARAM in _explicit_names(pf.main_explicit()),
         "limit": pf.main_value(LIMIT_PARAM) if LIMIT_PARAM in _explicit_names(pf.main_explicit()) else None,
         "map_existed": os.path.exists(MAP_FILE),
+        "map_previous": pf.read_map(),
+        "phase": "applied",
         "before": snapshot(pf),
     }
     _write_state(state_file, state)
@@ -382,8 +435,9 @@ def apply(pf, plan: Plan, state_file: str = STATE_FILE, backup_root: str = BACKU
         problems = verify(pf, state)
         if problems:
             raise PlanError("verification failed: " + "; ".join(problems))
-    except Exception:
-        deactivate(pf, state_file=state_file, remove_all=True)
+    except BaseException:   # includes Ctrl-C / SIGHUP-turned-KeyboardInterrupt
+        deactivate(pf, state_file=state_file)
+        finish(pf, state_file=state_file, force=True)
         raise
     return state
 
@@ -400,32 +454,80 @@ def _write_state(path: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
-def deactivate(pf, state_file: str = STATE_FILE, remove_all: bool = True) -> dict:
-    """Restore everything apply changed to its exact previous value."""
+def _load_state(state_file: str) -> dict:
     with open(state_file) as fh:
-        state = json.load(fh)
+        return json.load(fh)
+
+
+def deactivate(pf, state_file: str = STATE_FILE) -> list[str]:
+    """Phase 1: restore the listeners' exact previous cleanup_service_name.
+
+    After ``postfix reload`` no new archive copies are made. The archive route
+    and pipe stay in place so copies already queued are still delivered to
+    the archive; ``finish`` removes them once the queue holds none.
+    Returns warnings (never raises on a listener edited by hand meanwhile).
+    """
+    state = _load_state(state_file)
+    warnings = []
     for name, before in state["listeners"].items():
         previous = before["cleanup_service_name"]
-        if previous is None:
-            try:
+        try:
+            if previous is None:
                 pf.remove_service_param(name, "inet", "cleanup_service_name")
-            except RuntimeError:
-                pass   # never set (apply failed early)
-        else:
-            pf.set_service_param(name, "inet", "cleanup_service_name", previous)
-    if remove_all:
-        for name in (PIPE_SERVICE, ARCHIVE_SERVICE):
-            try:
-                pf.remove_service(name, "unix")
-            except RuntimeError:
-                pass
-        if state["transport_maps_explicit"]:
+            else:
+                pf.set_service_param(name, "inet", "cleanup_service_name", previous)
+        except RuntimeError:
+            pass   # never set (apply failed early) or listener removed by hand
+    pf.check()
+    services = parse_services(pf.master_lines(), pf.service_params())
+    for name, before in state["listeners"].items():
+        svc = services.get((name, "inet"))
+        if svc is None:
+            warnings.append(f"{name}/inet no longer exists")
+            continue
+        now = {k: v for k, v in svc.params.items() if k != "cleanup_service_name"}
+        was = {k: v for k, v in before["params"].items() if k != "cleanup_service_name"}
+        if svc.params.get("cleanup_service_name") != before["cleanup_service_name"]:
+            warnings.append(f"{name}/inet cleanup_service_name is {svc.params.get('cleanup_service_name')!r}, "
+                            f"expected {before['cleanup_service_name']!r}")
+        if now != was:
+            warnings.append(f"{name}/inet has other options that were edited since apply; they were left as they are")
+    state["phase"] = "listeners-restored"
+    _write_state(state_file, state)
+    return warnings
+
+
+def finish(pf, state_file: str = STATE_FILE, force: bool = False) -> dict:
+    """Phase 2: remove the archive route, services and map once nothing is queued for the archive."""
+    state = _load_state(state_file)
+    if state.get("phase") != "listeners-restored":
+        raise PlanError("run 'deactivate' and 'postfix reload' first")
+    if not force:
+        queued = pf.archive_copies_queued()
+        if queued:
+            raise PlanError(f"{queued} queued message(s) still carry the archive copy; removing the archive route "
+                            "now could send them elsewhere. Wait until 'postqueue -j' shows none, then retry.")
+    for name in (PIPE_SERVICE, ARCHIVE_SERVICE):
+        try:
+            pf.remove_service(name, "unix")
+        except RuntimeError:
+            pass
+    # Remove only our map from the *current* transport_maps; later edits stay.
+    current = pf.main_value("transport_maps")
+    entries = [e for e in re.split(r"[\s,]+", current.strip()) if e]
+    if MAP_REF in entries:
+        remaining = [e for e in entries if e != MAP_REF]
+        if remaining:
+            pf.set_main("transport_maps", state["transport_maps"] if remaining == _entries(state["transport_maps"])
+                        else ", ".join(remaining))
+        elif state["transport_maps_explicit"]:
             pf.set_main("transport_maps", state["transport_maps"] or "")
         else:
             try:
                 pf.remove_main("transport_maps")
             except RuntimeError:
                 pass
+    if pf.main_value(LIMIT_PARAM) == "1":
         if state["limit_explicit"]:
             pf.set_main(LIMIT_PARAM, state["limit"])
         else:
@@ -433,17 +535,17 @@ def deactivate(pf, state_file: str = STATE_FILE, remove_all: bool = True) -> dic
                 pf.remove_main(LIMIT_PARAM)
             except RuntimeError:
                 pass
-        if not state["map_existed"]:
-            pf.remove_map()
+    if state.get("map_previous") is not None:
+        pf.write_map(state["map_previous"])
+    elif not state["map_existed"]:
+        pf.remove_map()
     pf.check()
-    services = parse_services(pf.master_lines(), pf.service_params())
-    for name, before in state["listeners"].items():
-        svc = services.get((name, "inet"))
-        if svc is not None and svc.params != before["params"]:
-            raise RuntimeError(f"{name}/inet options were not restored exactly: {svc.params} != {before['params']}")
-    if remove_all:
-        os.replace(state_file, state_file + f".deactivated-{state['applied']}")
+    os.replace(state_file, state_file + f".deactivated-{state['applied']}")
     return state
+
+
+def _entries(value: str | None) -> list[str]:
+    return [e for e in re.split(r"[\s,]+", (value or "").strip()) if e]
 
 
 def main(argv: list[str] | None = None, pf=None) -> int:
@@ -454,29 +556,38 @@ def main(argv: list[str] | None = None, pf=None) -> int:
     apply_p = sub.add_parser("apply", help="apply the capture change (does not reload Postfix)")
     apply_p.add_argument("--listener", action="append", default=[])
     apply_p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
-    sub.add_parser("deactivate", help="restore every changed setting to its exact previous value")
+    deact = sub.add_parser("deactivate", help="phase 1: restore the listeners (then postfix reload); "
+                                               "--finish: phase 2, remove the archive route once the queue is clear")
+    deact.add_argument("--finish", action="store_true")
+    deact.add_argument("--force", action="store_true", help="with --finish: remove even if archive copies are queued")
+    plan_p.add_argument("--allow-other-port", action="store_true", help=argparse.SUPPRESS)
+    apply_p.add_argument("--allow-other-port", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("status", help="show the recorded state")
     args = p.parse_args(argv)
     pf = pf or Postfix()
     try:
         if args.cmd == "plan":
-            describe(pf, make_plan(pf, args.listener))
+            describe(pf, make_plan(pf, args.listener, args.allow_other_port))
             return 0
+        if os.geteuid() != 0:
+            print("run as root", file=sys.stderr)
+            return 1
         if args.cmd == "status":
             if not os.path.exists(STATE_FILE):
                 print("capture is not applied (no state file)")
                 return 0
             with open(STATE_FILE) as fh:
                 state = json.load(fh)
-            print(f"applied {state['applied']} to: {', '.join(n + '/inet' for n in state['listeners'])}")
+            print(f"applied {state['applied']} to: {', '.join(n + '/inet' for n in state['listeners'])}"
+                  f" (phase: {state.get('phase', 'applied')})")
+            if state.get("phase") == "listeners-restored":
+                print(f"archive copies still queued: {pf.archive_copies_queued()}")
+                return 0
             problems = verify(pf, state)
             print("verification: " + ("ok" if not problems else "; ".join(problems)))
             return 0 if not problems else 1
-        if os.geteuid() != 0:
-            print("run as root", file=sys.stderr)
-            return 1
         if args.cmd == "apply":
-            plan = make_plan(pf, args.listener)
+            plan = make_plan(pf, args.listener, args.allow_other_port)
             describe(pf, plan)
             if not args.yes and input("Apply these changes? Type 'yes': ").strip() != "yes":
                 print("aborted; nothing changed")
@@ -485,9 +596,15 @@ def main(argv: list[str] | None = None, pf=None) -> int:
             print(f"applied and verified; backups in {state['backup_dir']}; state in {STATE_FILE}")
             print("Activate with:  postfix reload")
             return 0
+        if args.cmd == "deactivate" and not args.finish:
+            for warning in deactivate(pf):
+                print(f"warning: {warning}")
+            print("listener overrides restored. Now run:  postfix reload")
+            print("then, once 'postqueue -j' holds no archive copies:  capture_postfix.py deactivate --finish")
+            return 0
         if args.cmd == "deactivate":
-            deactivate(pf)
-            print("previous listener overrides, transport_maps and services restored")
+            finish(pf, force=args.force)
+            print("archive route, services and map removed; transport_maps keeps any later edits.")
             print("Activate with:  postfix reload")
             return 0
     except PlanError as exc:

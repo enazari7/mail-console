@@ -32,6 +32,7 @@ class FakePostfix:
         self.tables = tables or {"hash:/etc/postfix/transport": {"bounces@example.com": "bouncecoll:"}}
         self.map_written = None
         self.checks = 0
+        self.queued_archive = 0
 
     def _load(self, line):
         parts = line.split()
@@ -64,6 +65,16 @@ class FakePostfix:
 
     def main_value(self, name):
         return self.main.get(name, "")
+
+    def main_expanded(self, name):
+        value = self.main.get(name, "")
+        return re.sub(r"\$(\w+)", lambda m: self.main.get(m.group(1), ""), value)
+
+    def archive_copies_queued(self):
+        return self.queued_archive
+
+    def read_map(self):
+        return self.map_written
 
     def main_explicit(self):
         return "".join(f"{k} = {v}\n" for k, v in sorted(self.main.items()))
@@ -194,7 +205,8 @@ def test_deactivate_restores_exactly(paths):
         before = pf.snapshot()
         cp.apply(pf, cp.make_plan(pf, []), state_file=str(state_file), backup_root=str(backups), now="T2")
         assert pf.snapshot() != before
-        cp.deactivate(pf, state_file=str(state_file))
+        assert cp.deactivate(pf, state_file=str(state_file)) == []
+        cp.finish(pf, state_file=str(state_file))
         assert pf.snapshot() == before
         assert not state_file.exists()
 
@@ -222,3 +234,109 @@ def test_apply_refuses_twice_and_when_services_exist(paths):
 def test_never_called_by_lifecycle_scripts():
     for name in ("install.sh", "update.sh", "rollback.sh", "uninstall.sh"):
         assert "capture_postfix" not in (ROOT / "deploy" / name).read_text()
+
+
+# --- review regressions ----------------------------------------------------------
+
+def applied(paths, pf=None, **kw):
+    state_file, backups = paths
+    pf = pf or FakePostfix(**kw)
+    cp.apply(pf, cp.make_plan(pf, []), state_file=str(state_file), backup_root=str(backups), now="T9")
+    return pf
+
+
+def test_finish_refuses_while_archive_copies_are_queued(paths):
+    pf = applied(paths)
+    cp.deactivate(pf, state_file=str(paths[0]))
+    # Listener restored, but the route to the pipe stays while copies are queued.
+    assert pf.query(cp.MAP_REF, cp.ARCHIVE_ADDRESS) == "mailconsole-archive:"
+    assert ("mailconsole-archive", "unix") in pf.services
+    pf.queued_archive = 3
+    with pytest.raises(cp.PlanError, match="still carry the archive copy"):
+        cp.finish(pf, state_file=str(paths[0]))
+    pf.queued_archive = 0
+    cp.finish(pf, state_file=str(paths[0]))
+    assert ("mailconsole-archive", "unix") not in pf.services
+
+
+def test_finish_requires_phase_one(paths):
+    pf = applied(paths)
+    with pytest.raises(cp.PlanError, match="run 'deactivate'"):
+        cp.finish(pf, state_file=str(paths[0]))
+
+
+def test_later_transport_map_edits_survive_deactivation(paths):
+    pf = applied(paths)
+    pf.main["transport_maps"] += ", hash:/etc/postfix/bounce_transport"   # admin edit after apply
+    cp.deactivate(pf, state_file=str(paths[0]))
+    cp.finish(pf, state_file=str(paths[0]))
+    assert pf.main["transport_maps"] == "hash:/etc/postfix/transport, hash:/etc/postfix/bounce_transport"
+
+
+def test_existing_always_bcc_is_refused():
+    with pytest.raises(cp.PlanError, match="always_bcc is already in use"):
+        cp.make_plan(FakePostfix(main={"transport_maps": "", "always_bcc": "compliance@example.org"}), [])
+    master = PRODUCTION_MASTER.replace("cleanup    unix  n       -       y       -       0       cleanup",
+                                       "cleanup    unix  n       -       y       -       0       cleanup "
+                                       "-o always_bcc=compliance@example.org")
+    with pytest.raises(cp.PlanError, match="always_bcc is already in use"):
+        cp.make_plan(FakePostfix(master), [])
+
+
+def test_manual_listener_edit_warns_and_still_finishes(paths):
+    pf = applied(paths)
+    pf.params[("91.107.182.219:submission", "inet")]["smtpd_tls_auth_only"] = "no"   # edited by hand
+    warnings = cp.deactivate(pf, state_file=str(paths[0]))
+    assert any("edited since apply" in w for w in warnings)
+    cp.finish(pf, state_file=str(paths[0]))
+    assert not paths[0].exists()
+    assert cp.make_plan(pf, [])   # can be applied again
+
+
+def test_interrupt_during_apply_restores(paths, monkeypatch):
+    state_file, backups = paths
+    pf = FakePostfix()
+    before = pf.snapshot()
+    real = pf.set_service
+
+    def boom(name, type_, line):
+        if name == cp.PIPE_SERVICE:
+            raise KeyboardInterrupt
+        return real(name, type_, line)
+    monkeypatch.setattr(pf, "set_service", boom)
+    with pytest.raises(KeyboardInterrupt):
+        cp.apply(pf, cp.make_plan(pf, []), state_file=str(state_file), backup_root=str(backups), now="T10")
+    assert pf.snapshot() == before
+
+
+def test_port_25_is_refused_even_with_global_sasl():
+    pf = FakePostfix(main={"transport_maps": "", "smtpd_sasl_auth_enable": "yes"})
+    with pytest.raises(cp.PlanError, match="not a submission port"):
+        cp.make_plan(pf, ["smtp"])
+
+
+def test_verify_expands_variables_and_service_overrides(paths):
+    pf = FakePostfix(main={"transport_maps": "hash:/etc/postfix/transport", "smtpd_sasl_auth_enable": "no",
+                           "my_aliases": "hash:/etc/postfix/virtual", "virtual_alias_maps": "$my_aliases"},
+                     tables={"hash:/etc/postfix/transport": {},
+                             "hash:/etc/postfix/virtual": {cp.ARCHIVE_ADDRESS: "elsewhere@example.org"}})
+    with pytest.raises(cp.PlanError, match="rewrites"):
+        applied(paths, pf)
+    master = PRODUCTION_MASTER + "rewrite    unix  -       -       y       -       -       trivial-rewrite -o transport_maps=hash:/x\n"
+    with pytest.raises(cp.PlanError, match="overrides transport_maps"):
+        cp.make_plan(FakePostfix(master), [])
+
+
+def test_global_cleanup_service_name_is_the_base(paths):
+    master = PRODUCTION_MASTER + "mycleanup  unix  n       -       n       -       0       cleanup\n"
+    plan = cp.make_plan(FakePostfix(master, main={"transport_maps": "", "cleanup_service_name": "mycleanup"}), [])
+    assert plan.base.name == "mycleanup"
+
+
+def test_existing_map_file_is_restored(paths):
+    pf = FakePostfix()
+    pf.map_written = "# operator's own content\n"
+    applied(paths, pf)
+    cp.deactivate(pf, state_file=str(paths[0]))
+    cp.finish(pf, state_file=str(paths[0]))
+    assert pf.map_written == "# operator's own content\n"
