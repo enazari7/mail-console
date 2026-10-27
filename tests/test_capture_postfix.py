@@ -322,7 +322,8 @@ def test_verify_expands_variables_and_service_overrides(paths):
                              "hash:/etc/postfix/virtual": {cp.ARCHIVE_ADDRESS: "elsewhere@example.org"}})
     with pytest.raises(cp.PlanError, match="rewrites"):
         applied(paths, pf)
-    master = PRODUCTION_MASTER + "rewrite    unix  -       -       y       -       -       trivial-rewrite -o transport_maps=hash:/x\n"
+    master = (PRODUCTION_MASTER
+              + "rewrite    unix  -       -       y       -       -       trivial-rewrite -o transport_maps=hash:/x\n")
     with pytest.raises(cp.PlanError, match="overrides transport_maps"):
         cp.make_plan(FakePostfix(master), [])
 
