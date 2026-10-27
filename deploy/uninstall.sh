@@ -19,10 +19,13 @@ rm -rf /opt/mail-console
 echo "==> removed code, units and wrapper"
 
 if [ "$PURGE" -eq 1 ]; then
-  rm -rf /etc/mail-console /var/lib/mail-console
+  rm -rf /etc/mail-console /var/lib/mail-console /var/spool/mail-console
+  if id -u mcarchive >/dev/null 2>&1; then userdel mcarchive; fi
+  getent group mcarchive >/dev/null && groupdel mcarchive || true
   if id -u mailconsole >/dev/null 2>&1; then userdel mailconsole; fi
   getent group mailconsole >/dev/null && groupdel mailconsole || true
   echo "==> purged configuration, database and the mailconsole user"
 else
-  echo "==> kept /etc/mail-console and /var/lib/mail-console (use --purge to delete)"
+  echo "==> kept /etc/mail-console, /var/lib/mail-console and /var/spool/mail-console (use --purge to delete)"
+  echo "    If message capture was activated in Postfix, deactivate it first (docs/MAIL-CAPTURE.md)."
 fi

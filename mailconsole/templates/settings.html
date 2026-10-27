@@ -2,7 +2,7 @@
 {% block title %}Settings{% endblock %}
 {% block content %}
 <header class="page-head"><div><h1>Settings</h1></div></header>
-{% if saved %}<div class="banner ok" role="status">{{ {"password": "Password changed. Other sessions were signed out.", "display": "Display preferences saved.", "retention": "Retention saved. It is applied by the collector's hourly maintenance.", "sessions": "Other sessions signed out."}.get(saved, "Saved.") }}</div>{% endif %}
+{% if saved %}<div class="banner ok" role="status">{{ {"password": "Password changed. Other sessions were signed out.", "display": "Display preferences saved.", "retention": "Retention saved. It is applied by the collector's hourly maintenance.", "sessions": "Other sessions signed out.", "totp": "Two-factor authentication enabled. Other sessions were signed out.", "totp-off": "Two-factor authentication disabled."}.get(saved, "Saved.") }}</div>{% endif %}
 {% if error %}<div class="banner error" role="alert">{{ error }}</div>{% endif %}
 
 <div class="grid-2">
@@ -24,6 +24,32 @@
       <label>Confirm new password<input type="password" name="confirm_password" autocomplete="new-password" required minlength="12" maxlength="1024"></label>
       <button class="btn primary" type="submit">Change password</button>
     </form>
+    <h3 id="2fa">Two-factor authentication</h3>
+    {% if totp_setup %}
+      <p>Add this key to an authenticator app (TOTP, 6 digits, 30 seconds), then enter the current code to confirm.</p>
+      <dl class="meta compact"><dt>Key</dt><dd class="mono wrap">{{ totp_setup.secret }}</dd><dt>URI</dt><dd class="mono wrap small">{{ totp_setup.uri }}</dd></dl>
+      <form method="post" action="/settings/totp/enable" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <input type="hidden" name="secret" value="{{ totp_setup.secret }}">
+        <label>Current code<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required></label>
+        <button class="btn primary" type="submit">Enable two-factor authentication</button>
+      </form>
+    {% elif totp_enabled %}
+      <p><span class="badge st-accepted">Enabled</span> A code from your authenticator app is required at every sign-in.</p>
+      <form method="post" action="/settings/totp/disable" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Current password<input type="password" name="password" autocomplete="current-password" required></label>
+        <label>Current code<input name="code" inputmode="numeric" autocomplete="one-time-code" maxlength="7" required></label>
+        <button class="btn" type="submit">Disable two-factor authentication</button>
+      </form>
+    {% else %}
+      <p class="muted small">Optional, recommended when the console is reachable through the HTTPS proxy.</p>
+      <form method="post" action="/settings/totp/setup" class="stack">
+        <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
+        <label>Current password<input type="password" name="password" autocomplete="current-password" required></label>
+        <button class="btn" type="submit">Set up two-factor authentication</button>
+      </form>
+    {% endif %}
   </section>
   <section class="card">
     <h2>Display</h2>
@@ -38,7 +64,8 @@
     <form method="post" action="/settings/retention" class="stack">
       <input type="hidden" name="csrf_token" value="{{ session.csrf_token }}">
       <label>Keep email history for (days)<input type="number" name="retention_days" min="7" max="3650" value="{{ retention_days }}" required></label>
-      <p class="muted small">Messages whose last event is older than this are deleted hourly. Independently, the database is capped at {{ max_db_mb }} MB (MC_MAX_DB_MB); when the cap is reached the oldest history is removed first. Queue snapshots are kept for at most 14 days.</p>
+      <label>Keep archived message content for (days)<input type="number" name="archive_retention_days" min="1" max="3650" value="{{ archive_retention_days }}" required></label>
+      <p class="muted small">Messages whose last event is older than this are deleted hourly. Independently, the database is capped at {{ max_db_mb }} MB (MC_MAX_DB_MB); when the cap is reached the oldest history is removed first. Queue snapshots are kept for at most 14 days. Archived content is deleted only after its own retention period; when archive storage is full, new captures wait in the spool instead of older content being dropped.</p>
       <button class="btn primary" type="submit">Save retention</button>
     </form>
   </section>

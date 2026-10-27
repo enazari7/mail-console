@@ -113,3 +113,76 @@ jobs:
       - name: Service logs
         if: failure()
         run: sudo journalctl -u mail-console-web -u mail-console-collector --no-pager -n 200
+
+  capture-e2e:
+    # Real Postfix (CI runner only) with exactly the proposed integration from
+    # docs/MAIL-CAPTURE.md. CI has no SASL submission service, so the archiving
+    # cleanup service is attached to the port-25 smtpd here instead.
+    name: postfix capture e2e (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      ADMIN_PASSWORD: ci-only-password-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Postfix (CI runner only)
+        run: |
+          echo "postfix postfix/main_mailer_type select Local only" | sudo debconf-set-selections
+          echo "postfix postfix/mailname string ci.example.org" | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postfix python3.12-venv >/dev/null
+          postconf -h mail_version
+          sudo install -m 0640 -o root -g adm /dev/null /var/log/postfix.log
+          sudo postconf -e maillog_file=/var/log/postfix.log
+      - name: Install Mail Console
+        run: |
+          sudo install -d -m 0755 /etc/mail-console
+          sed -e 's#^MC_LOG_PATH=.*#MC_LOG_PATH=/var/log/postfix.log#' -e 's#^MC_POLL_INTERVAL=.*#MC_POLL_INTERVAL=1#' \
+            .env.example | sudo tee /etc/mail-console/mail-console.env >/dev/null
+          sudo ./deploy/install.sh
+          echo "$ADMIN_PASSWORD" | sudo mail-console admin create --username admin --password-stdin
+      - name: Apply the proposed Postfix integration (CI only)
+        run: |
+          sudo cp deploy/postfix/mailconsole_transport /etc/postfix/mailconsole_transport
+          sudo postmap /etc/postfix/mailconsole_transport
+          sudo postconf -e "transport_maps = hash:/etc/postfix/mailconsole_transport" \
+                           "mailconsole-archive_destination_recipient_limit = 1"
+          sudo postconf -M "cleanup-archive/unix=cleanup-archive unix n - y - 0 cleanup"
+          sudo postconf -P "cleanup-archive/unix/always_bcc=archive@mail-console.invalid"
+          sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/opt/mail-console/current/bin/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
+          sudo postconf -P "smtp/inet/cleanup_service_name=cleanup-archive"
+          sudo postfix check
+          sudo systemctl restart postfix
+          sudo ./deploy/capture-preflight.sh || [ $? -eq 2 ]
+      - name: Send messages and verify the archive
+        run: |
+          python3 scripts/send_test_mail.py --to root@localhost --to postmaster@localhost
+          sleep 12
+          sudo grep -E "archive@mail-console.invalid|status=" /var/log/postfix.log | tail -n 12
+          test -z "$(sudo ls -A /var/spool/mail-console/incoming)"
+          sudo mail-console archive status
+          sudo mail-console archive verify
+          test "$(sudo postqueue -j | wc -l)" = 0
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin \
+            --expect-archive ACTIVATION-CI --expect-archive PLAIN-CI-BODY --expect "root@localhost"
+          sudo ls -l /var/lib/mail-console/archive/*/*/ | head
+      - name: Deactivation stops capture, delivery continues
+        run: |
+          sudo postconf -PX smtp/inet/cleanup_service_name
+          sudo postfix check && sudo systemctl reload postfix
+          before=$(sudo mail-console archive status | awk '$1=="archives"{print $2}')
+          python3 scripts/send_test_mail.py --to root@localhost --only-plain
+          sleep 8
+          after=$(sudo mail-console archive status | awk '$1=="archives"{print $2}')
+          echo "archives before=$before after=$after"
+          test "$before" = "$after"
+          sudo grep -c "status=sent (delivered to mailbox)" /var/log/postfix.log
+      - name: Logs
+        if: failure()
+        run: |
+          sudo tail -n 80 /var/log/postfix.log || true
+          sudo journalctl -u mail-console-web -u mail-console-collector --no-pager -n 120
+          sudo ls -laR /var/spool/mail-console || true

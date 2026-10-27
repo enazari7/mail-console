@@ -10,7 +10,8 @@ from .conftest import PASSWORD, csrf_from, login
 # --- authentication & session security ---------------------------------------
 
 @pytest.mark.parametrize("path", ["/", "/emails", "/emails?q=alice%40example.org", "/emails/1", "/monitoring",
-                                  "/emails/export.csv?q=alice", "/emails/1/content-preview",
+                                  "/emails/export.csv?q=alice", "/archives/1", "/archives/1/raw.eml",
+                                  "/archives/1/parts/0", "/archives/1/preview.html", "/audit",
                                   "/settings", "/queue/3F2A61C0D3"])
 def test_no_unauthenticated_access(client, admin, path):
     r = client.get(path)
@@ -226,3 +227,73 @@ def test_failed_attempt_is_recorded_before_hashing(client, admin, db, monkeypatc
 def test_huge_custom_range_is_bounded(logged_in):
     r = logged_in.get("/", params={"range": "custom", "start": "0001-01-01T00:00", "end": "9999-12-31T00:00"})
     assert r.status_code == 200 and r.text.count('class="bar"') <= 60
+
+
+# --- two-factor authentication and HTTPS behind the proxy --------------------
+
+def test_totp_enrolment_login_and_replay(client, admin, db, monkeypatch):
+    import re as _re
+
+    from mailconsole import auth as _auth
+    assert login(client).status_code == 303
+    token = csrf_from(client.get("/settings").text)
+    page = client.post("/settings/totp/setup", data={"csrf_token": token, "password": PASSWORD}).text
+    secret = _re.search(r'name="secret" value="([A-Z2-7]{32})"', page).group(1)
+    assert client.post("/settings/totp/enable", data={"csrf_token": token, "secret": secret,
+                                                      "code": "000000"}).status_code == 400
+    import time as _real_time
+    clock = [_real_time.time()]
+    monkeypatch.setattr(_auth._time, "time", lambda: clock[0])
+    assert client.post("/settings/totp/enable", data={"csrf_token": token, "secret": secret,
+                                                      "code": _auth.totp_now(secret, clock[0])}).status_code == 303
+    client.post("/logout", data={"csrf_token": csrf_from(client.get("/settings").text)})
+    # Password alone no longer signs in.
+    step1 = login(client)
+    assert step1.status_code == 200 and "Authentication code" in step1.text
+    assert client.get("/").status_code == 303
+    csrf = csrf_from(step1.text)
+    bad = client.post("/login/totp", data={"code": "123456", "csrf_token": csrf, "next": "/"})
+    assert bad.status_code == 401
+    clock[0] += 30   # the enrolment code's time step was consumed: use the next one
+    ok = client.post("/login/totp", data={"code": _auth.totp_now(secret, clock[0]),
+                                          "csrf_token": csrf_from(bad.text), "next": "/"})
+    assert ok.status_code == 303 and client.get("/").status_code == 200
+    # Replaying the same code for a new login fails.
+    client.post("/logout", data={"csrf_token": csrf_from(client.get("/settings").text)})
+    again = login(client)
+    replay = client.post("/login/totp", data={"code": _auth.totp_now(secret, clock[0]),
+                                              "csrf_token": csrf_from(again.text), "next": "/"})
+    assert replay.status_code == 401
+    actions = {r[0] for r in db.execute("SELECT action FROM audit_log")}
+    assert {"totp_enabled", "totp_failed", "login"} <= actions
+
+
+def test_totp_pending_login_attempts_are_limited(client, admin, db):
+    from mailconsole import auth as _auth
+    with tx(db):
+        db.execute("UPDATE admins SET totp_secret = ?", (_auth.totp_new_secret(),))
+    page = login(client)
+    for _ in range(_auth.PENDING_LOGIN_ATTEMPTS):
+        page = client.post("/login/totp", data={"code": "000000", "csrf_token": csrf_from(page.text), "next": "/"})
+    final = client.post("/login/totp", data={"code": "000000", "csrf_token": csrf_from(page.text), "next": "/"})
+    assert final.status_code == 303 and final.headers["location"] == "/login"
+
+
+def test_totp_disable_from_cli(cfg, db, admin, capsys):
+    from mailconsole import auth as _auth
+    from mailconsole import cli
+    with tx(db):
+        db.execute("UPDATE admins SET totp_secret = ?", (_auth.totp_new_secret(),))
+    assert cli.main(["admin", "totp-disable", "--username", "admin"]) == 0
+    assert db.execute("SELECT totp_secret FROM admins").fetchone()[0] is None
+
+
+def test_proxied_requests_must_be_https(cfg, app_db, admin):
+    import dataclasses
+    proxied = TestClient(create_app(dataclasses.replace(cfg, trust_proxy=True)), base_url="http://127.0.0.1:8710",
+                         follow_redirects=False)
+    r = proxied.get("/login", headers={"x-forwarded-for": "198.51.100.7", "x-forwarded-proto": "http"})
+    assert r.status_code == 400 and "HTTPS required" in r.text
+    r = proxied.get("/login", headers={"x-forwarded-for": "198.51.100.7", "x-forwarded-proto": "https"})
+    assert r.status_code == 200 and "max-age" in r.headers["strict-transport-security"]
+    assert proxied.get("/login").status_code == 200   # direct loopback (SSH tunnel) still works

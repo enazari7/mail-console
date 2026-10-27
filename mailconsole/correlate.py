@@ -51,6 +51,7 @@ class IngestStats:
     ops: int = 0
     dropped: int = 0
     messages_touched: set[int] = field(default_factory=set)
+    queue_ids: set[str] = field(default_factory=set)
 
     def merge(self, other: "IngestStats") -> None:
         self.lines += other.lines
@@ -59,6 +60,7 @@ class IngestStats:
         self.ops += other.ops
         self.dropped += other.dropped
         self.messages_touched |= other.messages_touched
+        self.queue_ids |= other.queue_ids
 
 
 def _domain(address: str) -> str | None:
@@ -93,6 +95,7 @@ class Ingestor:
                     touched_qids.add(key)
         for qid, host in sorted(touched_qids):
             stats.messages_touched |= self._resegment(qid, host)
+            stats.queue_ids.add(qid)
         for qid, host, ts in self._dropped:
             self.conn.execute(
                 "UPDATE messages SET events_truncated = 1 WHERE id = (SELECT id FROM messages WHERE queue_id = ?"
@@ -179,6 +182,15 @@ class Ingestor:
             ),
         )
         stats.events += 1
+        if ev.kind == "archive_delivery" and ev.status != "sent":
+            # The archive copy is deferred or failed (e.g. low disk space):
+            # surface it as an operational problem; real recipients are unaffected.
+            self.conn.execute(
+                "INSERT OR IGNORE INTO ops_events(ts, host, program, pid, level, message, line_hash)"
+                " VALUES (?, ?, ?, ?, 'error', ?, ?)",
+                (rec.ts, rec.host, rec.program, rec.pid,
+                 f"Mail Console archive copy for {ev.queue_id} {ev.status}: {redact(ev.response or '')}"[:4000],
+                 line_hash[:-1] + b"A"))
         return (ev.queue_id, rec.host) if ev.queue_id is not None else None
 
     def _new_message(self, queue_id: str | None, host: str, ts: int, origin: str = "unknown") -> int:
@@ -298,6 +310,7 @@ def _recompute(conn: sqlite3.Connection, message_id: int) -> None:
         "sender": None, "message_id": None, "subject": None, "size": None, "nrcpt": None,
         "client": None, "sasl_username": None, "orig_queue_id": None, "notification_qid": None,
         "has_start": 0, "has_qmgr": 0, "active_count": 0, "last_dsn": None, "last_response": None,
+        "archive_status": None, "archive_ts": None, "archive_response": None,
     }
     origin = msg["origin"] if msg["origin"] in ("noqueue", "dsn") else "unknown"
     recipients: dict[str, dict] = {}
@@ -364,6 +377,10 @@ def _recompute(conn: sqlite3.Connection, message_id: int) -> None:
                     r["final_ts"] = e["ts"]
             r.update(dsn=e["dsn"], relay=e["relay"], response=e["response"], delay=e["delay"], delays=e["delays"])
             summary["last_dsn"], summary["last_response"] = e["dsn"], e["response"]
+        elif kind == "archive_delivery":
+            # The Mail Console archive copy: tracked separately, never a recipient.
+            summary["archive_status"], summary["archive_ts"], summary["archive_response"] = (
+                e["status"], e["ts"], e["response"])
         elif kind == "expired":
             expired_ts = e["ts"]
             sender_sources.setdefault("expired", detail.get("from", ""))
@@ -401,6 +418,8 @@ def _recompute(conn: sqlite3.Connection, message_id: int) -> None:
             summary["sender"] = sender_sources[source]
             break
 
+    if summary["archive_status"] is not None and summary["nrcpt"]:
+        summary["nrcpt"] -= 1   # Postfix's nrcpt includes the archive copy
     if closed_ts is not None:
         for r in recipients.values():
             if r["status"] not in FINAL_STATES:
@@ -417,14 +436,16 @@ def _recompute(conn: sqlite3.Connection, message_id: int) -> None:
         "UPDATE messages SET sender = ?, message_id = ?, subject = ?, size = ?, nrcpt = ?, client = ?,"
         " sasl_username = ?, origin = ?, orig_queue_id = ?, notification_qid = ?, status = ?,"
         " has_start = ?, has_qmgr = ?, closed_ts = ?, active_count = ?, event_count = ?,"
-        " last_dsn = ?, last_response = ?, first_ts = coalesce(?, first_ts), last_ts = coalesce(?, last_ts)"
+        " last_dsn = ?, last_response = ?, first_ts = coalesce(?, first_ts), last_ts = coalesce(?, last_ts),"
+        " archive_status = ?, archive_ts = ?, archive_response = ?"
         " WHERE id = ?",
         (
             summary["sender"], summary["message_id"], summary["subject"], summary["size"], summary["nrcpt"],
             summary["client"], summary["sasl_username"], origin, summary["orig_queue_id"],
             summary["notification_qid"], status, summary["has_start"], summary["has_qmgr"], closed_ts,
             summary["active_count"], len(events), summary["last_dsn"], summary["last_response"],
-            first_ts, last_ts, message_id,
+            first_ts, last_ts, summary["archive_status"], summary["archive_ts"], summary["archive_response"],
+            message_id,
         ),
     )
     conn.execute("DELETE FROM recipients WHERE message_id = ?", (message_id,))

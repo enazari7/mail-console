@@ -194,7 +194,11 @@ SORTS = {
     "status": "row_status {d}, m.first_ts DESC, m.id DESC, r.id",
 }
 ROW_COLUMNS = (
-    "m.id, m.queue_id, m.first_ts, m.last_ts, m.sender, m.subject, m.message_id, m.status AS message_status,"
+    "m.id, m.queue_id, m.first_ts, m.last_ts, m.sender,"
+    " coalesce(m.subject, (SELECT a.subject FROM archives a WHERE a.message_id = m.id ORDER BY a.id LIMIT 1))"
+    " AS subject,"
+    " EXISTS (SELECT 1 FROM archives a WHERE a.message_id = m.id) AS archived,"
+    " m.message_id, m.status AS message_status,"
     " m.nrcpt, m.origin, r.address, r.domain, r.status AS recipient_status, r.dsn, r.response, r.relay,"
     " r.attempts, coalesce(r.final_ts, r.last_attempt_ts) AS outcome_ts, m.last_response, m.last_dsn,"
     " coalesce(r.status, m.status) AS row_status"
@@ -254,14 +258,18 @@ def _activity_where(f: ActivityFilter) -> tuple[str, list]:
         # 1) indexed candidate messages from the trigram FTS index,
         # 2) row-level check so a recipient row is shown only if the term is in
         #    a message-wide field or in that recipient's own fields.
-        clauses.append("m.id IN (SELECT rowid FROM message_search WHERE message_search MATCH ?)")
-        args.append(search.phrase(term))
         message_text = _row_text(["m.queue_id", "m.sender", "m.message_id", "m.subject", "m.sasl_username"])
         recipient_text = _row_text(["r.address", "r.orig_address", "r.domain",
                                     "CASE WHEN r.status != 'accepted' THEN r.response END"])
-        clauses.append(f"(instr({message_text}, ?) > 0 OR instr({recipient_text}, ?) > 0"
-                       " OR (r.id IS NULL AND instr(mc_fold(coalesce(m.last_response, '')), ?) > 0))")
-        args.extend([search.fold(term)] * 3)
+        # Log metadata (row-level), or archived content (subject, header
+        # addresses, attachment names, body text) of the whole message.
+        clauses.append(
+            "((m.id IN (SELECT rowid FROM message_search WHERE message_search MATCH ?)"
+            f" AND (instr({message_text}, ?) > 0 OR instr({recipient_text}, ?) > 0"
+            " OR (r.id IS NULL AND instr(mc_fold(coalesce(m.last_response, '')), ?) > 0)))"
+            " OR m.id IN (SELECT message_id FROM archives WHERE message_id IS NOT NULL AND id IN"
+            " (SELECT rowid FROM archive_search WHERE archive_search MATCH ?)))")
+        args.extend([search.phrase(term)] + [search.fold(term)] * 3 + [search.phrase(term)])
     elif term:
         # Too short for substring search: exact, indexed matches only.
         clauses.append("(m.queue_id = ? OR r.domain = ? OR r.address = ? COLLATE NOCASE)")
@@ -401,13 +409,9 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
     if msg["events_truncated"]:
         gaps.append("This message exceeded the per-message event limit; some retry events were not stored, so "
                     "retry counts are lower bounds.")
-    content = conn.execute("SELECT * FROM message_content WHERE message_id = ?", (message_id,)).fetchone()
-    if content is not None:
-        content = dict(content)
-        try:
-            content["attachments"] = json.loads(content["attachments"] or "[]")
-        except ValueError:
-            content["attachments"] = []
+    archives = [dict(r) for r in conn.execute(
+        "SELECT id, captured_ts, link_method, link_note, sha256, size FROM archives WHERE message_id = ?"
+        " ORDER BY captured_ts, id", (message_id,))]
     finals = [r["final_ts"] for r in recipients if r["final_ts"]]
     summary = {
         "attempts": sum(r["attempts"] for r in recipients),
@@ -417,7 +421,7 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
         "dsns": sorted({r["dsn"] for r in recipients if r["dsn"]}),
     }
     return {"message": msg, "recipients": recipients, "events": events, "related": related,
-            "reuse_count": reuse, "reuse_first_ts": reuse_first, "gaps": gaps, "content": content,
+            "reuse_count": reuse, "reuse_first_ts": reuse_first, "gaps": gaps, "archives": archives,
             "summary": summary}
 
 

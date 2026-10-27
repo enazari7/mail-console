@@ -122,6 +122,15 @@ class Config:
     trust_proxy: bool
     allowed_hosts: list[str] = field(default_factory=list)
     store_raw_lines: bool = True
+    archive_enabled: bool = True
+    archive_recipient: str = "archive@mail-console.invalid"
+    archive_spool: Path = Path("/var/spool/mail-console/incoming")
+    archive_dir: Path = Path("/var/lib/mail-console/archive")
+    archive_key_file: Path | None = None
+    archive_retention_days: int = 90
+    archive_max_bytes: int = 10 * 1024**3
+    archive_warn_percent: int = 80
+    archive_min_free_bytes: int = 2 * 1024**3
 
 
 def load_config() -> Config:
@@ -167,4 +176,13 @@ def load_config() -> Config:
         trust_proxy=_bool("MC_TRUST_PROXY", False),
         allowed_hosts=allowed,
         store_raw_lines=_bool("MC_STORE_RAW_LINES", True),
+        archive_enabled=_bool("MC_ARCHIVE_ENABLED", True),
+        archive_recipient=os.environ.get("MC_ARCHIVE_RECIPIENT", "archive@mail-console.invalid").strip().lower(),
+        archive_spool=Path(os.environ.get("MC_ARCHIVE_SPOOL", "/var/spool/mail-console/incoming")),
+        archive_dir=Path(os.environ.get("MC_ARCHIVE_DIR", str(data_dir / "archive"))),
+        archive_key_file=Path(os.environ.get("MC_ARCHIVE_KEY_FILE", "/etc/mail-console/archive.key")),
+        archive_retention_days=_int("MC_ARCHIVE_RETENTION_DAYS", 90, 1, 3650),
+        archive_max_bytes=_int("MC_ARCHIVE_MAX_GB", 10, 1, 100_000) * 1024**3,
+        archive_warn_percent=_int("MC_ARCHIVE_WARN_PERCENT", 80, 10, 99),
+        archive_min_free_bytes=_int("MC_ARCHIVE_MIN_FREE_MB", 2048, 64) * 1024**2,
     )

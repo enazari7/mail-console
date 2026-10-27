@@ -12,7 +12,7 @@ import sqlite3
 from datetime import datetime, timezone
 from importlib import resources
 from typing import Iterator
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from fastapi import Depends, FastAPI, Form, Request
@@ -21,12 +21,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from . import __version__, auth, charts, queries
+from . import __version__, archive, audit, auth, charts, queries
 from .config import Config
 from .db import connect, get_setting, now_us, pending_migrations, set_setting, tx
 from .queries import STATUS_HELP, STATUS_LABELS, US
 
 SESSION_COOKIE = "mc_session"
+PENDING_COOKIE = "mc_pending_login"
 LOGIN_CSRF_COOKIE = "mc_login_csrf"
 PAGE_SIZES = (25, 50, 100)
 THEMES = ("system", "dark", "light")
@@ -244,6 +245,10 @@ def describe_event(e: dict) -> str:
                 "bounced": "Bounced (permanent failure)", "deliverable": "Address probe: deliverable",
                 "undeliverable": "Address probe: undeliverable"}.get(e["status"], f"status={e['status']}")
         return f"{verb} for <{e['recipient']}>" + (f" via {e['relay']}" if e["relay"] else "")
+    if kind == "archive_delivery":
+        if e["status"] == "sent":
+            return "Copy delivered to the Mail Console archive"
+        return f"Archive copy {e['status']} (real recipients are not affected)"
     if kind == "expired":
         return "Maximum queue lifetime reached; message returned to sender"
     if kind == "notification":
@@ -291,6 +296,10 @@ def create_app(cfg: Config) -> FastAPI:
     async def guard(request: Request, call_next):
         if not _host_allowed(request.headers.get("host"), cfg.allowed_hosts):
             return Response("Invalid Host header", status_code=400, media_type="text/plain")
+        proto = request.headers.get("x-forwarded-proto", "").lower()
+        if cfg.trust_proxy and "x-forwarded-for" in request.headers and proto != "https":
+            # Requests relayed by the reverse proxy must have arrived over HTTPS.
+            return Response("HTTPS required", status_code=400, media_type="text/plain")
         if request.method == "POST":
             origin = request.headers.get("origin")
             if origin and origin != "null" and not _host_allowed(urlsplit(origin).netloc, cfg.allowed_hosts):
@@ -302,6 +311,8 @@ def create_app(cfg: Config) -> FastAPI:
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers.setdefault("X-Frame-Options", "DENY")
         response.headers["Referrer-Policy"] = "same-origin"
+        if cfg.trust_proxy and proto == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         if not request.url.path.startswith("/static/"):
@@ -390,14 +401,56 @@ def create_app(cfg: Config) -> FastAPI:
             return fail("The server is busy. Try again in a few seconds.", 429)
         auth.finish_attempt(conn, attempt, ip, admin_id is not None)
         if admin_id is None:
+            audit.record(conn, admin_id=None, username=None, client_ip=ip, action="login_failed")
             return fail("Invalid username or password.", 401)
+        if auth.totp_secret_of(conn, admin_id):
+            pending = auth.create_pending_login(conn, admin_id, ip)
+            response = render(request, conn, "login_totp.html", None, next=_safe_next(next), csrf=new_csrf, error=None)
+            set_cookie(response, LOGIN_CSRF_COOKIE, new_csrf, 3600)
+            set_cookie(response, PENDING_COOKIE, pending, auth.PENDING_LOGIN_SECONDS)
+            return response
+        return start_session(request, conn, admin_id, ip, next)
+
+    def start_session(request: Request, conn: sqlite3.Connection, admin_id: int, ip: str, next_url: str) -> Response:
         token = auth.create_session(conn, admin_id, idle_minutes=cfg.session_idle_minutes,
                                     max_hours=cfg.session_max_hours, client_ip=ip,
                                     user_agent=request.headers.get("user-agent"))
-        response = RedirectResponse(_safe_next(next), status_code=303)
+        username = conn.execute("SELECT username FROM admins WHERE id = ?", (admin_id,)).fetchone()[0]
+        audit.record(conn, admin_id=admin_id, username=username, client_ip=ip, action="login")
+        response = RedirectResponse(_safe_next(next_url), status_code=303)
         set_cookie(response, SESSION_COOKIE, token, cfg.session_max_hours * 3600)
         response.delete_cookie(LOGIN_CSRF_COOKIE, path="/")
+        response.delete_cookie(PENDING_COOKIE, path="/")
         return response
+
+    @app.post("/login/totp", response_class=HTMLResponse)
+    def login_totp(request: Request, code: str = Form(""), csrf_token: str = Form(""), next: str = Form("/"),
+                   conn: sqlite3.Connection = Depends(get_db)):
+        new_csrf = secrets.token_urlsafe(32)
+        ip = _client_ip(request, cfg)
+
+        def again(message: str, code_: int) -> HTMLResponse:
+            response = render(request, conn, "login_totp.html", None, status_code=code_, next=_safe_next(next),
+                              csrf=new_csrf, error=message)
+            set_cookie(response, LOGIN_CSRF_COOKIE, new_csrf, 3600)
+            return response
+
+        if not auth.csrf_matches(request.cookies.get(LOGIN_CSRF_COOKIE), csrf_token):
+            return again("Your login form expired. Sign in again.", 403)
+        pending = auth.take_pending_login(conn, request.cookies.get(PENDING_COOKIE))
+        if pending is None:
+            response = RedirectResponse("/login", status_code=303)
+            response.delete_cookie(PENDING_COOKIE, path="/")
+            return response
+        token_hash, admin_id = pending
+        if not auth.login_allowed(conn, ip, ""):
+            return again("Too many failed attempts. Wait 15 minutes and try again.", 429)
+        if not auth.totp_check(conn, admin_id, code):
+            auth.record_attempt(conn, ip, f"totp:{admin_id}", False)
+            audit.record(conn, admin_id=admin_id, username=None, client_ip=ip, action="totp_failed")
+            return again("Invalid authentication code.", 401)
+        auth.finish_pending_login(conn, token_hash)
+        return start_session(request, conn, admin_id, ip, next)
 
     @app.post("/logout")
     def logout(request: Request, csrf_token: str = Form(""), session: auth.Session = Depends(session_dep),
@@ -502,33 +555,118 @@ def create_app(cfg: Config) -> FastAPI:
 
         return StreamingResponse(generate(), media_type="text/csv; charset=utf-8", headers=headers)
 
+    def archive_store():
+        if not cfg.archive_enabled:
+            return None
+        try:
+            return archive.open_store(cfg)
+        except (OSError, ValueError):
+            return None
+
+    def audit_access(request: Request, conn, session: auth.Session, action: str, target: str, detail: str = ""):
+        audit.record(conn, admin_id=session.admin_id, username=session.username, client_ip=_client_ip(request, cfg),
+                     action=action, target=target, detail=detail)
+
     @app.get("/emails/{message_id}", response_class=HTMLResponse)
     def email_detail(request: Request, message_id: int, session: auth.Session = Depends(session_dep),
                      conn: sqlite3.Connection = Depends(get_db)):
         detail = queries.message_detail(conn, message_id)
         if detail is None:
             raise StarletteHTTPException(404, "Message not found.")
-        return render(request, conn, "email_detail.html", session, d=detail)
+        content = None
+        if detail["archives"]:
+            store = archive_store()
+            if store is not None:
+                content = archive.load_view(conn, store, detail["archives"][0]["id"])
+            else:
+                content = {"error": "The message archive is not available (MC_ARCHIVE_ENABLED or key file)."}
+            audit_access(request, conn, session, "view_content", f"archive:{detail['archives'][0]['id']}",
+                         f"message {message_id}")
+        return render(request, conn, "email_detail.html", session, d=detail, content=content)
 
-    @app.get("/emails/{message_id}/content-preview")
-    def content_preview(message_id: int, session: auth.Session = Depends(session_dep),
+    @app.get("/archives/{archive_id}", response_class=HTMLResponse)
+    def archive_detail(request: Request, archive_id: int, session: auth.Session = Depends(session_dep),
+                       conn: sqlite3.Connection = Depends(get_db)):
+        store = archive_store()
+        a = archive.get_archive(conn, archive_id)
+        if a is None:
+            raise StarletteHTTPException(404, "Archived message not found.")
+        if a["message_id"] is not None:
+            return RedirectResponse(f"/emails/{a['message_id']}", status_code=303)
+        content = archive.load_view(conn, store, archive_id) if store else {"error": "The message archive is not available."}
+        audit_access(request, conn, session, "view_content", f"archive:{archive_id}", "unlinked archive")
+        return render(request, conn, "archive_detail.html", session, a=a, content=content)
+
+    def require_archive(conn, archive_id: int):
+        store = archive_store()
+        a = archive.get_archive(conn, archive_id)
+        if store is None or a is None:
+            raise StarletteHTTPException(404, "Archived message not found.")
+        return store, a
+
+    @app.get("/archives/{archive_id}/preview.html")
+    def archive_preview(request: Request, archive_id: int, session: auth.Session = Depends(session_dep),
                         conn: sqlite3.Connection = Depends(get_db)):
-        """Retained HTML body, for display only inside a sandboxed frame.
+        """HTML body for the sandboxed preview frame.
 
-        The response itself is sandboxed by CSP (opaque origin, no scripts, no
-        forms, no remote loads), so it cannot act in the console's origin even
-        if opened directly.
+        Served with a sandbox CSP (opaque origin, no scripts, no forms, no
+        plugins, no network loads except data: images), so it cannot act in
+        the console's origin even if opened directly in a tab.
         """
-        row = conn.execute("SELECT html_body FROM message_content WHERE message_id = ?", (message_id,)).fetchone()
-        if row is None or not row["html_body"]:
-            raise StarletteHTTPException(404, "No retained HTML content.")
-        # Belt and braces next to the sandbox CSP: drop meta refresh/redirects.
-        body = re.sub(r"<meta\b[^>]*http-equiv[^>]*>", "", row["html_body"], flags=re.IGNORECASE)
-        return HTMLResponse(body, headers={
+        store, _ = require_archive(conn, archive_id)
+        try:
+            html = archive.html_for_preview(conn, store, archive_id)
+        except (archive.IntegrityError, OSError) as exc:
+            raise StarletteHTTPException(500, f"The stored copy could not be read: {exc}") from None
+        if html is None:
+            raise StarletteHTTPException(404, "This message has no HTML part.")
+        audit_access(request, conn, session, "preview_html", f"archive:{archive_id}")
+        return HTMLResponse(html, headers={
             "Content-Security-Policy": PREVIEW_CSP,
             "X-Frame-Options": "SAMEORIGIN",
             "Cross-Origin-Resource-Policy": "same-origin",
+            "Referrer-Policy": "no-referrer",
         })
+
+    @app.get("/archives/{archive_id}/raw.eml")
+    def archive_raw(request: Request, archive_id: int, session: auth.Session = Depends(session_dep),
+                    conn: sqlite3.Connection = Depends(get_db)):
+        store, a = require_archive(conn, archive_id)
+        audit_access(request, conn, session, "download_eml", f"archive:{archive_id}", f"{a['size']} bytes")
+        name = f"{a['queue_id']}-{a['sha256'][:12]}.eml"
+        return StreamingResponse(archive.stream_raw(store, a), media_type="message/rfc822", headers={
+            "Content-Disposition": f'attachment; filename="{name}"',
+            "Content-Length": str(a["size"]),
+            "Content-Security-Policy": "sandbox; default-src 'none'",
+        })
+
+    @app.get("/archives/{archive_id}/parts/{part_index}")
+    def archive_part(request: Request, archive_id: int, part_index: int, session: auth.Session = Depends(session_dep),
+                     conn: sqlite3.Connection = Depends(get_db)):
+        store, a = require_archive(conn, archive_id)
+        part = next((p for p in archive.get_parts(conn, archive_id) if p.index == part_index), None)
+        if part is None or part.role in ("container",):
+            raise StarletteHTTPException(404, "Attachment not found.")
+        filename = part.filename or f"part-{part_index}.bin"
+        ascii_name = "".join(ch if 32 < ord(ch) < 127 and ch not in '"\\;' else "_" for ch in filename)
+        audit_access(request, conn, session, "download_attachment", f"archive:{archive_id}/part:{part_index}",
+                     filename)
+        # Always a download, never rendered in the console's origin (an HTML or
+        # SVG attachment could otherwise run script here).
+        return StreamingResponse(archive.stream_part(store, a, part), media_type="application/octet-stream",
+                                 headers={
+                                     "Content-Disposition": f"attachment; filename=\"{ascii_name}\"; "
+                                                            f"filename*=UTF-8''{quote(filename)}",
+                                     "Content-Security-Policy": "sandbox; default-src 'none'",
+                                 })
+
+    @app.get("/audit", response_class=HTMLResponse)
+    def audit_page(request: Request, action: str = "", session: auth.Session = Depends(session_dep),
+                   conn: sqlite3.Connection = Depends(get_db)):
+        actions = [r[0] for r in conn.execute("SELECT DISTINCT action FROM audit_log ORDER BY action")]
+        action = action if action in actions else ""
+        return render(request, conn, "audit.html", session, entries=audit.recent(conn, 300, action),
+                      actions=actions, action=action)
 
     @app.get("/queue/{queue_id}")
     def by_queue_id(queue_id: str, session: auth.Session = Depends(session_dep),
@@ -544,6 +682,12 @@ def create_app(cfg: Config) -> FastAPI:
         display = Display(conn)
         level = level if level in ("warning", "error", "fatal", "panic", "auth", "info") else ""
         data = queries.monitoring(conn, cfg.db_path, now_us(), level)
+        data["archive"] = archive.status(conn, cfg)
+        data["archive"]["blocked"] = conn.execute(
+            "SELECT value FROM collector_state WHERE key = 'archive_blocked'").fetchone()
+        data["unlinked_archives"] = [dict(r) for r in conn.execute(
+            "SELECT id, queue_id, captured_ts, subject, link_method, link_note FROM archives"
+            " WHERE message_id IS NULL ORDER BY captured_ts DESC LIMIT 20")]
         return render(request, conn, "monitoring.html", session, m=data, level=level,
                       queue_chart=charts.sparkline(data["queue_history"], lambda us: display.ts(us, "%m-%d %H:%M"),
                                                    width=760, height=80))
@@ -559,7 +703,9 @@ def create_app(cfg: Config) -> FastAPI:
         from .collector import retention_days
         return {"admin": admin, "sessions": sessions, "timezones": timezones, "page_sizes": PAGE_SIZES,
                 "themes": THEMES, "retention_days": retention_days(conn, cfg), "max_db_mb": cfg.max_db_mb,
-                "idle_minutes": cfg.session_idle_minutes, "max_hours": cfg.session_max_hours}
+                "idle_minutes": cfg.session_idle_minutes, "max_hours": cfg.session_max_hours,
+                "archive_retention_days": archive.archive_retention_days(conn, cfg),
+                "totp_enabled": bool(auth.totp_secret_of(conn, session.admin_id)), "totp_setup": None}
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request, saved: str = "", session: auth.Session = Depends(session_dep),
@@ -610,14 +756,71 @@ def create_app(cfg: Config) -> FastAPI:
         return RedirectResponse("/settings?saved=display", status_code=303)
 
     @app.post("/settings/retention")
-    def save_retention(request: Request, retention_days: int = Form(...), csrf_token: str = Form(""),
-                       session: auth.Session = Depends(session_dep), conn: sqlite3.Connection = Depends(get_db)):
+    def save_retention(request: Request, retention_days: int = Form(...), archive_retention_days: int | None = Form(None),
+                       csrf_token: str = Form(""), session: auth.Session = Depends(session_dep),
+                       conn: sqlite3.Connection = Depends(get_db)):
         check_csrf(session, csrf_token)
         if not 7 <= retention_days <= 3650:
             return settings_error(request, conn, session, "Retention must be between 7 and 3650 days.")
+        if archive_retention_days is not None and not 1 <= archive_retention_days <= 3650:
+            return settings_error(request, conn, session, "Archive retention must be between 1 and 3650 days.")
         with tx(conn):
             set_setting(conn, "retention_days", str(retention_days))
+            if archive_retention_days is not None:
+                set_setting(conn, "archive_retention_days", str(archive_retention_days))
+        audit.record(conn, admin_id=session.admin_id, username=session.username, client_ip=_client_ip(request, cfg),
+                     action="change_retention", detail=f"history {retention_days} d, archive {archive_retention_days} d")
         return RedirectResponse("/settings?saved=retention", status_code=303)
+
+    def verify_password(request: Request, conn, session: auth.Session, password: str) -> HTMLResponse | None:
+        ip = _client_ip(request, cfg)
+        if not auth.login_allowed(conn, ip, session.username):
+            return settings_error(request, conn, session, "Too many failed attempts. Try again later.", 429)
+        try:
+            ok = auth.authenticate(conn, session.username, password) is not None
+        except auth.AuthBusy:
+            return settings_error(request, conn, session, "The server is busy. Try again in a few seconds.", 429)
+        if not ok:
+            auth.record_attempt(conn, ip, session.username, False)
+            return settings_error(request, conn, session, "Current password is incorrect.", 403)
+        return None
+
+    @app.post("/settings/totp/setup", response_class=HTMLResponse)
+    def totp_setup(request: Request, password: str = Form(""), csrf_token: str = Form(""),
+                   session: auth.Session = Depends(session_dep), conn: sqlite3.Connection = Depends(get_db)):
+        check_csrf(session, csrf_token)
+        failed = verify_password(request, conn, session, password)
+        if failed:
+            return failed
+        secret = auth.totp_new_secret()
+        ctx = settings_ctx(conn, session)
+        ctx["totp_setup"] = {"secret": secret, "uri": auth.totp_uri(secret, session.username)}
+        return render(request, conn, "settings.html", session, saved="", error=None, **ctx)
+
+    @app.post("/settings/totp/enable")
+    def totp_enable(request: Request, secret: str = Form(""), code: str = Form(""), csrf_token: str = Form(""),
+                    session: auth.Session = Depends(session_dep), conn: sqlite3.Connection = Depends(get_db)):
+        check_csrf(session, csrf_token)
+        if not re.fullmatch(r"[A-Z2-7]{32}", secret) or not auth.totp_enable(conn, session.admin_id, secret, code):
+            return settings_error(request, conn, session, "The code did not match. Set up two-factor authentication again.")
+        auth.delete_other_sessions(conn, session.admin_id, session.token_hash)
+        audit.record(conn, admin_id=session.admin_id, username=session.username, client_ip=_client_ip(request, cfg),
+                     action="totp_enabled")
+        return RedirectResponse("/settings?saved=totp", status_code=303)
+
+    @app.post("/settings/totp/disable")
+    def totp_disable(request: Request, password: str = Form(""), code: str = Form(""), csrf_token: str = Form(""),
+                     session: auth.Session = Depends(session_dep), conn: sqlite3.Connection = Depends(get_db)):
+        check_csrf(session, csrf_token)
+        failed = verify_password(request, conn, session, password)
+        if failed:
+            return failed
+        if not auth.totp_check(conn, session.admin_id, code):
+            return settings_error(request, conn, session, "Invalid authentication code.", 403)
+        auth.totp_disable(conn, session.admin_id)
+        audit.record(conn, admin_id=session.admin_id, username=session.username, client_ip=_client_ip(request, cfg),
+                     action="totp_disabled")
+        return RedirectResponse("/settings?saved=totp-off", status_code=303)
 
     @app.post("/settings/sessions/revoke")
     def revoke_sessions(csrf_token: str = Form(""), session: auth.Session = Depends(session_dep),

@@ -12,9 +12,9 @@ from .conftest import fixture_lines, ingest_lines, snapshot
 
 def test_migrations_are_idempotent_and_recorded(cfg):
     conn = connect(cfg.db_path)
-    assert migrate(conn) == ["0001_initial.sql", "0002_search_and_content.sql"]
+    assert migrate(conn) == ["0001_initial.sql", "0002_search_and_content.sql", "0003_mail_content.sql"]
     assert migrate(conn) == [] and pending_migrations(conn) == []
-    assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2]
+    assert [r[0] for r in conn.execute("SELECT version FROM schema_migrations ORDER BY version")] == [1, 2, 3]
     assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     assert conn.execute("PRAGMA auto_vacuum").fetchone()[0] == 2  # incremental
@@ -29,7 +29,7 @@ def test_failed_migration_rolls_back(cfg, monkeypatch):
         migrate(conn)
     assert not conn.in_transaction
     assert conn.execute("SELECT count(*) FROM sqlite_master WHERE name = 'half_done'").fetchone()[0] == 0
-    assert conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 2
+    assert conn.execute("SELECT max(version) FROM schema_migrations").fetchone()[0] == 3
 
 
 def test_history_survives_restart(cfg):

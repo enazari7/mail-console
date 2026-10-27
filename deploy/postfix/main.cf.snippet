@@ -1,0 +1,8 @@
+# --- BeastPing Mail Console: message archive (MAIL-CONTENT-01) ---------------
+# PROPOSAL FOR REVIEW. Apply with postconf -e (see docs/MAIL-CAPTURE.md).
+#
+# Route the archive address to the capture transport. If transport_maps is
+# already set, append this table to the existing list instead of replacing it.
+transport_maps = hash:/etc/postfix/mailconsole_transport
+# One archive copy per pipe invocation.
+mailconsole-archive_destination_recipient_limit = 1

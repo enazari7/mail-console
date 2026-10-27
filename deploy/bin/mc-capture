@@ -1,0 +1,6 @@
+#!/bin/sh
+# Postfix pipe(8) entry point for Mail Console message capture.
+# Runs the standard-library-only capture program with the system Python in
+# isolated mode: no virtualenv, no console services and no database involved.
+# Exit status 75 (temporary failure) defers only the archive copy.
+exec /usr/bin/python3 -I /opt/mail-console/current/mailconsole/capture.py "$@"

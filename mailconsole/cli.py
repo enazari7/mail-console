@@ -109,6 +109,13 @@ def cmd_admin(cfg, args) -> int:
         elif args.admin_cmd == "list":
             for row in conn.execute("SELECT username, created_ts, last_login_ts FROM admins ORDER BY id"):
                 print(row[0])
+        elif args.admin_cmd == "totp-disable":
+            row = conn.execute("SELECT id FROM admins WHERE username = ?", (args.username,)).fetchone()
+            if row is None:
+                print(f"no administrator named {args.username!r}", file=sys.stderr)
+                return 1
+            auth.totp_disable(conn, row[0])
+            print(f"two-factor authentication disabled for {args.username!r}")
         elif args.admin_cmd == "unlock":
             print(f"cleared {auth.clear_failures(conn)} failed login attempt(s)")
         elif args.admin_cmd == "delete":
@@ -145,6 +152,27 @@ def cmd_reindex(cfg, args) -> int:
     return 0
 
 
+def cmd_archive(cfg, args) -> int:
+    from . import archive
+    from .collector import require_schema
+    from .db import connect
+    conn = connect(cfg.db_path)
+    require_schema(conn)
+    if args.archive_cmd == "status":
+        for key, value in archive.status(conn, cfg).items():
+            print(f"{key:<20} {value}")
+        return 0
+    store = archive.open_store(cfg)
+    bad = 0
+    rows = conn.execute("SELECT sha256, path FROM archive_blobs ORDER BY sha256").fetchall()
+    for sha, rel in rows:
+        if not store.verify(rel, sha):
+            bad += 1
+            print(f"FAIL  {rel}: missing, unreadable, tampered or wrong key")
+    print(f"verified {len(rows) - bad} of {len(rows)} stored messages")
+    return 1 if bad else 0
+
+
 def cmd_parse_check(cfg, args) -> int:
     """Dry run: parse a log file and summarise what would be ingested. Writes nothing."""
     from .parser import classify, parse_syslog_line
@@ -159,7 +187,7 @@ def cmd_parse_check(cfg, args) -> int:
             if rec is None:
                 unparsed += 1
                 continue
-            item = classify(rec, cfg.postfix_prefixes, cfg.ops_programs)
+            item = classify(rec, cfg.postfix_prefixes, cfg.ops_programs, cfg.archive_recipient)
             if item is None:
                 continue
             if item.ops:
@@ -217,6 +245,17 @@ def cmd_check(cfg, args) -> int:
     for label, unit in cfg.monitor_units:
         s = monitor.check_unit(cfg.systemctl_cmd, label, unit)
         print(("ok    " if s.ok else "warn  ") + f"{label} ({unit}): {s.active_state or s.error}")
+    if cfg.archive_enabled:
+        from .blobstore import load_key
+        spool = cfg.archive_spool
+        print(("ok    " if spool.is_dir() else "warn  ") + f"archive spool {spool}"
+              + ("" if spool.is_dir() else " missing (message capture not set up)"))
+        try:
+            key = load_key(cfg.archive_key_file)
+            print(("ok    " if key else "warn  ") + "archive encryption key "
+                  + ("loaded" if key else f"not found at {cfg.archive_key_file} (stored content is not encrypted)"))
+        except (OSError, ValueError) as exc:
+            report(False, f"archive encryption key: {exc}")
     q = monitor.check_queue(cfg.postqueue_cmd)
     print(("ok    " if q.ok else "warn  ") + (f"postqueue: {q.total} queued" if q.ok else f"postqueue: {q.error}"))
     return 0 if ok else 1
@@ -242,6 +281,12 @@ def build_parser() -> argparse.ArgumentParser:
         a.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
     admin_sub.add_parser("list")
     admin_sub.add_parser("unlock", help="clear login throttling (failed attempts)")
+    td = admin_sub.add_parser("totp-disable", help="remove two-factor authentication (recovery)")
+    td.add_argument("--username", required=True)
+    arc = sub.add_parser("archive", help="message archive maintenance")
+    arc_sub = arc.add_subparsers(dest="archive_cmd", required=True)
+    arc_sub.add_parser("status", help="show archive health")
+    arc_sub.add_parser("verify", help="re-hash every stored message and check rows against files")
     d = admin_sub.add_parser("delete")
     d.add_argument("--username", required=True)
     sub.add_parser("purge", help="apply retention now")
@@ -255,7 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
 COMMANDS = {
     "serve": cmd_serve, "collect": cmd_collect, "migrate": cmd_migrate, "import": cmd_import,
     "admin": cmd_admin, "purge": cmd_purge, "reindex": cmd_reindex, "parse-check": cmd_parse_check,
-    "check": cmd_check,
+    "check": cmd_check, "archive": cmd_archive,
 }
 
 

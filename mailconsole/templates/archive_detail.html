@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% from "_macros.html" import icon %}
+{% block title %}Archived message{% endblock %}
+{% block content %}
+<nav class="crumbs small" aria-label="Breadcrumb"><a href="/monitoring">{{ icon("chevron-left") }}Monitoring</a></nav>
+<header class="page-head"><div><h1 dir="auto">{{ a.subject or "Archived message" }}</h1>
+<p class="muted">Archived copy for Postfix queue ID <span class="mono">{{ a.queue_id }}</span> that is not linked to a logged message.</p></div></header>
+<section class="card section">
+  {% set envelope_sender = none %}
+  {% set envelope_rcpts = none %}
+  {% include "_content.html" %}
+</section>
+{% endblock %}

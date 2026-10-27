@@ -46,7 +46,7 @@ def test_no_docker_and_no_mail_service_mutation():
         text = path.read_text()
         assert not mutating.search(text), path
         assert "postsuper" not in text and "postqueue -f" not in text and "postfix reload" not in text, path
-        assert "/etc/postfix" not in text and "/var/spool" not in text, path
+        assert "/etc/postfix" not in text and "/var/spool/postfix" not in text, path
 
 
 def test_python_code_runs_only_read_only_commands():

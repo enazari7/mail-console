@@ -71,7 +71,7 @@ def classify_lines(cfg: Config, lines: Iterable[tuple[str, datetime]]) -> list[C
         record = parse_syslog_line(line, bsd_tz=cfg.log_timezone, reference=ref)
         if record is None:
             continue
-        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs)
+        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs, cfg.archive_recipient)
         if item is not None:
             out.append(item)
     return out
@@ -80,7 +80,7 @@ def classify_lines(cfg: Config, lines: Iterable[tuple[str, datetime]]) -> list[C
 def classify_records(cfg: Config, records: Iterable[LogRecord]) -> list[Classified]:
     out = []
     for record in records:
-        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs)
+        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs, cfg.archive_recipient)
         if item is not None:
             out.append(item)
     return out
@@ -241,6 +241,16 @@ class Collector:
         self.cfg = cfg
         self.stop = stop or threading.Event()
         self.enable_monitor = enable_monitor
+        self.touched_queue_ids: set[str] = set()
+        self.archive_store = None
+        self._archive_note_at = 0.0
+        self._archive_blocked: str | None = None
+        if cfg.archive_enabled:
+            from .archive import open_store
+            try:
+                self.archive_store = open_store(cfg)
+            except (OSError, ValueError) as exc:
+                log.error("message archive disabled: cannot load MC_ARCHIVE_KEY_FILE: %s", exc)
         if cfg.log_source == "journald":
             self.source = JournaldSource(cfg.journalctl_cmd, cfg.journal_units)
         else:
@@ -253,7 +263,8 @@ class Collector:
         if batch.lines or batch.records or batch.notes or (batch.checkpoint and batch.checkpoint != cp):
             items = classify_lines(self.cfg, batch.lines) + classify_records(self.cfg, batch.records)
             with tx(conn):
-                ingest_batch(conn, self.cfg, ingestor, items)
+                stats = ingest_batch(conn, self.cfg, ingestor, items)
+                self.touched_queue_ids |= stats.queue_ids
                 _bump(conn, "lines_total", len(batch.lines) + len(batch.records))
                 for text in batch.notes:
                     log.warning(text)
@@ -262,6 +273,28 @@ class Collector:
                     save_checkpoint(conn, self.source.name, batch.checkpoint)
                 set_state(conn, "last_batch_ts", str(now_us()))
         return batch.more
+
+    def archive_step(self, conn: sqlite3.Connection) -> bool:
+        """Ingest captured message copies and (re)link archives. Returns True if more are waiting."""
+        if self.archive_store is None:
+            return False
+        from . import archive
+        stats = archive.process_spool(conn, self.cfg, self.archive_store)
+        touched, self.touched_queue_ids = self.touched_queue_ids | stats.queue_ids, set()
+        archive.relink(conn, touched)
+        now = time.monotonic()
+        problems = ([stats.blocked] if stats.blocked else []) + stats.errors
+        if stats.blocked != self._archive_blocked:
+            with tx(conn):
+                set_state(conn, "archive_blocked", stats.blocked or "")
+            self._archive_blocked = stats.blocked
+        if problems and now - self._archive_note_at > 3600:
+            with tx(conn):
+                for text in problems[:5]:
+                    log.error("message archive: %s", text)
+                    note(conn, f"message archive: {text}", "error")
+            self._archive_note_at = now
+        return stats.ingested + stats.duplicates >= archive.SPOOL_BATCH
 
     def run(self) -> None:
         cfg = self.cfg
@@ -282,6 +315,7 @@ class Collector:
                 more = False
                 try:
                     more = self.step(conn, ingestor)
+                    more = self.archive_step(conn) or more
                     now = time.monotonic()
                     if now >= next_heartbeat:
                         with tx(conn):
@@ -292,6 +326,14 @@ class Collector:
                         next_monitor = now + cfg.monitor_interval
                     if now >= next_maintenance:
                         result = apply_retention(conn, cfg)
+                        if self.archive_store is not None:
+                            from . import archive
+                            spool_notes = archive.cleanup_spool(cfg)
+                            result["archive"] = archive.apply_retention(conn, cfg, self.archive_store)
+                            if spool_notes:
+                                with tx(conn):
+                                    for text in spool_notes[:20]:
+                                        note(conn, f"message archive: {text}", "info")
                         log.info("maintenance: %s", result)
                         next_maintenance = now + MAINTENANCE_SECONDS
                 except sqlite3.OperationalError as exc:
