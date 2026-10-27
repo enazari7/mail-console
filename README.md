@@ -120,7 +120,7 @@ SMTP responses of failed recipients.
 ### Growth controls
 
 * Retention (default 90 days, Settings) deletes messages by last activity, hourly.
-* `MC_MAX_DB_MB` (default 2048) caps live database size; oldest history goes first.
+* `MC_MAX_DB_MB` (default 3072) caps live database size; the archived-content search index is trimmed first, then the oldest history (never the last day).
 * `MC_MAX_EVENTS_PER_MESSAGE` caps stored retry events per message; final outcomes
   are always kept and the detail page says when counts are lower bounds.
 * Queue snapshots keep counts for 14 days and the entry list only for the latest.

@@ -16,9 +16,14 @@ cleanup-archive unix  n       -       y       -       0       cleanup
 mailconsole-archive unix -    n       n       -       4       pipe
   user=mcarchive argv=/usr/local/libexec/mail-console/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}
 
-# 3) On the EXISTING authenticated submission service (port 587) add ONE line,
-#    so only authenticated submissions use the archiving cleanup service:
+# 3) On the EXISTING public authenticated submission listener add ONE option.
+#    On the BeastPing server that listener is named 91.107.182.219:submission
+#    (the loopback 127.0.0.1:submission listener is not captured):
 #
-#    submission inet n       -       y       -       -       smtpd
+#    91.107.182.219:submission inet n - y - - smtpd
 #      ...existing -o options unchanged...
 #      -o cleanup_service_name=cleanup-archive
+#
+#    Use deploy/capture_postfix.py (plan/apply/deactivate) rather than editing
+#    by hand: it discovers the listener, mirrors the cleanup columns, keeps
+#    transport_maps, verifies routing and restores the exact previous values.

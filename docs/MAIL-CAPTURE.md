@@ -73,51 +73,102 @@ BeastPing ──SMTP AUTH :587──▶ submission smtpd ──▶ cleanup-archi
 
 ## Exact proposed Postfix change
 
-Files: `deploy/postfix/master.cf.snippet`, `deploy/postfix/main.cf.snippet` and
-`deploy/postfix/mailconsole_transport`. All commands are run as root on the mail
-server, **only after review and approval**.
+Production does not use a plain `submission/inet` service. It has two
+named listeners, both with SMTP AUTH, TLS and the Mailguard/OpenDKIM milters:
 
-1. Preflight (read-only):
-   ```bash
-   sudo /opt/mail-console/current/deploy/capture-preflight.sh
-   sudo postconf -n > /root/postfix-main.cf.before
-   sudo cp /etc/postfix/master.cf /root/postfix-master.cf.before
-   ```
+| master.cf service | Purpose | Captured? |
+|---|---|---|
+| `91.107.182.219:submission/inet` | Public authenticated submission; **BeastPing connects here** | **Yes** |
+| `127.0.0.1:submission/inet` | Loopback authenticated submission (local clients on the server) | **No** (by default) |
 
-2. Transport map for the archive address:
-   ```bash
-   sudo install -m 0644 /opt/mail-console/current/deploy/postfix/mailconsole_transport /etc/postfix/mailconsole_transport
-   sudo postmap /etc/postfix/mailconsole_transport
-   ```
+* **Why loopback is excluded:** BeastPing does not use the loopback listener.
+  Local clients on the mail server (tests, tools) should not fill the
+  archive. If BeastPing is ever moved to loopback, add it explicitly with
+  `--listener 127.0.0.1:submission`.
+* **CI coverage:** the end-to-end job checks both behaviours with this exact
+  listener layout. Mail on the public listener is archived; mail on loopback
+  is delivered and not archived.
 
-3. `main.cf`. If `postconf -h transport_maps` is not empty, append to it instead:
-   ```bash
-   sudo postconf -e "transport_maps = hash:/etc/postfix/mailconsole_transport" \
-                    "mailconsole-archive_destination_recipient_limit = 1"
-   ```
+The change is made by an operator tool, not by hand-typed `postconf` lines.
+`deploy/capture_postfix.py` uses only the Python standard library and is
+never called by install, update, rollback or uninstall. What it does:
 
-4. `master.cf`: two new services. Copy the chroot column from the existing
-   `cleanup` line (`postconf -M cleanup/unix`):
-   ```bash
-   sudo postconf -M "cleanup-archive/unix=cleanup-archive unix n - y - 0 cleanup"
-   sudo postconf -P "cleanup-archive/unix/always_bcc=archive@mail-console.invalid"
-   sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/usr/local/libexec/mail-console/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
-   ```
+1. **Discovers** every smtpd listener with `postconf -M` and `postconf -P`.
+   It selects the single public (non-loopback), authenticated
+   (`smtpd_sasl_auth_enable=yes`) submission listener. If there is none, or
+   more than one, it **refuses** and asks for `--listener NAME`. It refuses a
+   name that does not exist (it never creates a generic `submission`
+   service) and refuses listeners without SMTP AUTH (port 25 inbound is
+   never captured).
+2. **Mirrors the cleanup service** the listener uses today. On Ubuntu that is
+   `cleanup unix n - y - 0 cleanup`: chroot `y`, plus any `-o` options it
+   has. `cleanup-archive` becomes an exact copy with only its name changed,
+   plus `always_bcc=archive@mail-console.invalid`.
+3. **Prepends** `hash:/etc/postfix/mailconsole_transport` to the existing
+   `transport_maps`. Existing maps and their order, including the bounce
+   collector's routing, are kept. The new map holds exactly one key, so it
+   cannot shadow any other address.
+4. Adds the `mailconsole-archive` pipe service and
+   `mailconsole-archive_destination_recipient_limit = 1`.
+5. Sets **only** `cleanup_service_name=cleanup-archive` on the selected
+   listener. Every other option (TLS, SASL, restrictions,
+   `smtpd_sender_login_maps`, `smtpd_milters`, `milter_macro_daemon_name`, …)
+   stays as it is.
+6. Records every previous value in `/etc/postfix/mailconsole-capture.json` and
+   copies `main.cf`/`master.cf` to `/var/backups/mail-console-postfix/<time>/`
+   **before** changing anything.
+7. **Verifies** the result, and **automatically restores** everything if a
+   check fails. The checks:
+   - the listener's options equal the old ones plus `cleanup_service_name`;
+   - no other listener uses `cleanup-archive`;
+   - `cleanup-archive` has the same columns as its base;
+   - the first `transport_maps` hit for `archive@mail-console.invalid` is
+     `mailconsole-archive:`;
+   - no `virtual_alias_maps` or canonical map rewrites the address;
+   - `mail-console.invalid` is not a local, virtual or relay domain.
 
-5. The **only change to an existing service**: let authenticated submission use
-   the archiving cleanup service.
-   ```bash
-   sudo postconf -P "submission/inet/cleanup_service_name=cleanup-archive"
-   ```
-   If BeastPing also submits on port 465, repeat this for `submissions/inet`
-   (or `smtps/inet`).
+     Together these mean the archive copy can only go to the internal pipe
+     and never leaves the server.
+8. Runs `postfix check`. It does **not** reload; the operator does.
 
-6. Validate and activate. `reload` is graceful: no connections are dropped and
-   queued mail is unaffected.
-   ```bash
-   sudo postfix check
-   sudo postfix reload
-   ```
+### Safe activation commands (production, only after approval)
+
+```bash
+# 0. Console side installed or updated at the reviewed commit (creates mcarchive, spool, key, entry point)
+cd /usr/local/src/mail-console && sudo ./deploy/update.sh
+
+# 1. Read-only checks and the exact plan; must select 91.107.182.219:submission/inet
+sudo /opt/mail-console/current/deploy/capture-preflight.sh
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py plan
+
+# 2. Apply. It prints the plan, asks for "yes", backs up, changes, verifies, and auto-restores on failure.
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py apply
+
+# 3. Activate (graceful: no connections dropped, queued mail unaffected)
+sudo postfix reload
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py status
+```
+
+If preflight cannot identify a single safe listener, it fails clearly (exit 1).
+In that case, choose one explicitly:
+
+```bash
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py plan --listener 91.107.182.219:submission
+```
+
+The equivalent manual change, for review (not needed when using the tool):
+
+```bash
+sudo install -m 0644 /opt/mail-console/current/deploy/postfix/mailconsole_transport /etc/postfix/mailconsole_transport
+sudo postmap /etc/postfix/mailconsole_transport
+sudo postconf -e "transport_maps = hash:/etc/postfix/mailconsole_transport, $(postconf -h transport_maps)"
+sudo postconf -e "mailconsole-archive_destination_recipient_limit = 1"
+sudo postconf -M "cleanup-archive/unix=cleanup-archive unix n - y - 0 cleanup"      # columns copied from cleanup/unix
+sudo postconf -P "cleanup-archive/unix/always_bcc=archive@mail-console.invalid"
+sudo postconf -M 'mailconsole-archive/unix=mailconsole-archive unix - n n - 4 pipe user=mcarchive argv=/usr/local/libexec/mail-console/mc-capture --queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}'
+sudo postconf -P "91.107.182.219:submission/inet/cleanup_service_name=cleanup-archive"
+sudo postfix check && sudo postfix reload
+```
 
 ### Effect on the current mail flow
 
@@ -152,30 +203,34 @@ queue on a disk that is filling up. Nothing is dropped silently.
 
 ## Deactivation (rollback of the Postfix change)
 
-Deactivation takes effect immediately for new mail and does not affect
-queued mail:
-
 ```bash
-sudo postconf -PX submission/inet/cleanup_service_name
-sudo postfix check && sudo postfix reload
+sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py deactivate
+sudo postfix reload
 ```
 
-To remove everything afterwards:
+`deactivate` restores every value recorded at `apply` exactly:
 
-1. Remove the two `master.cf` services:
-   ```bash
-   sudo postconf -MX cleanup-archive/unix mailconsole-archive/unix
-   ```
-2. Restore `transport_maps` to its previous value from `/root/postfix-main.cf.before`.
-3. Validate and reload:
-   ```bash
-   sudo postfix check && sudo postfix reload
-   ```
+- the listener's previous `cleanup_service_name`, or its absence; a value that
+  existed before is put back, never just removed;
+- `transport_maps` and the recipient limit, set again to their old values or
+  removed if they were not set;
+- the two services removed;
+- the map file removed if Mail Console created it.
 
-Do this before uninstalling Mail Console. A normal uninstall keeps the
-wrapper `/usr/local/libexec/mail-console/mc-capture`. If capture is still
-active, the wrapper defers copies (exit 75) instead of losing them; `--purge`
-removes it.
+It then checks that the listener options equal the recorded ones.
+
+- **Test coverage:** CI compares `postconf -n`, `postconf -M` and
+  `postconf -P` before `apply` and after `deactivate`, and they are identical.
+- **Timing and backups:** deactivation affects new mail immediately and leaves
+  queued mail alone. The backups under `/var/backups/mail-console-postfix/`
+  stay for reference.
+
+Do this before uninstalling Mail Console or rolling back to a release
+without capture. If capture is still active then:
+
+- a normal uninstall keeps the wrapper `/usr/local/libexec/mail-console/mc-capture`;
+- the wrapper defers archive copies (exit 75) instead of losing them;
+- `--purge` removes the wrapper.
 
 ## Verification after activation
 
@@ -211,9 +266,9 @@ submission service, so there the archiving cleanup is attached to port 25.
 | `MC_ARCHIVE_SPOOL` | `/var/spool/mail-console/incoming` | Capture spool (`mcarchive:mailconsole`, `2770`) |
 | `MC_ARCHIVE_KEY_FILE` | `/etc/mail-console/archive.key` | 256-bit key; encryption is on when the file exists (`install.sh` creates it) |
 | `MC_ARCHIVE_RETENTION_DAYS` | 90 | Overridden in Settings; archives older than this are deleted hourly |
-| `MC_ARCHIVE_MAX_GB` | 10 | Hard limit for the store; reaching it pauses ingestion, never deletes early |
+| `MC_ARCHIVE_MAX_GB` | 8 | Hard limit for the store; reaching it pauses ingestion, never deletes early |
 | `MC_ARCHIVE_WARN_PERCENT` | 80 | Monitoring turns to "Attention" |
-| `MC_ARCHIVE_MIN_FREE_MB` | 2048 | Collector pauses ingestion below this free space |
+| `MC_ARCHIVE_MIN_FREE_MB` | 4096 | Collector pauses ingestion below this free space |
 | capture `--min-free-mb` | 1024 | Below this free space the copy is skipped with a recorded marker |
 | capture `--max-spool-mb` | 2048 | Spool size at which copies are skipped with a recorded marker |
 | `MC_ARCHIVE_ENCRYPTION` | `required` | `required`: never store plaintext; `off`: allow storing without a key |
@@ -227,6 +282,60 @@ submission service, so there the archiving cleanup is attached to port 25.
 * **Large messages:** large messages and attachments are streamed. Nothing
   loads a whole message into memory: tested with a 16 MiB message peaking
   under 8 MiB of Python memory.
+
+## Disk capacity on the 38 GB ARM64 server
+
+Everything shares one 38 GB filesystem: the OS, the logs, the Postfix
+queue, the console database, the archive and the capture spool.
+
+| Consumer | Typical size | Notes |
+|---|---|---|
+| Ubuntu 24.04, packages, BeastPing app, caches | 6–8 GB | measure with `df -h /` before activation |
+| `/var/log` (rsyslog rotation, journald) | 1–3 GB | `journalctl --disk-usage`; cap with `SystemMaxUse=` if large |
+| **Postfix queue headroom** | **≥ 4 GB kept free** | covers a destination outage (deferred mail) and Postfix's own free-space check: smtpd defers new mail when free space drops below `queue_minfree` (at least 1.5 × `message_size_limit`) |
+| Capture spool | ≤ 2 GB (`--max-spool-mb`) | normally empty; fills only while the console is not ingesting |
+| Console database | `MC_MAX_DB_MB` | ~5 KB per logged message + ~10 KB per archived message (search index of 2,048 body chars) |
+| Archive store | `MC_ARCHIVE_MAX_GB` | ≈ message size per archived message (encryption adds 0.03 %) |
+
+* **Archive size per day** ≈ messages per day × average size. Measure the
+  real values on the server before activation:
+  ```bash
+  # submitted messages per day and their average size, from Postfix logs
+  sudo grep -h 'postfix/qmgr.*nrcpt=' /var/log/syslog | grep -c . 
+  sudo grep -h 'postfix/qmgr.*nrcpt=' /var/log/syslog | sed -E 's/.*size=([0-9]+).*/\1/' \
+    | awk '{s+=$1; n++} END {printf "%d messages, average %.1f KB\n", n, s/n/1024}'
+  ```
+* **Recommended budget** (these are the defaults of this release; an existing
+  `/etc/mail-console/mail-console.env` keeps its own values, so set them there).
+  About 12–14 GB in total for Mail Console, which
+  leaves about 15 GB free for the OS, logs and Postfix queue:
+  - `MC_ARCHIVE_MAX_GB=8`;
+  - `MC_MAX_DB_MB=3072`;
+  - spool cap 2 GB;
+  - capture `--min-free-mb=1024`;
+  - `MC_ARCHIVE_MIN_FREE_MB=4096`, so the collector stops filling the disk
+    while 4 GB are still free for Postfix.
+* **Retention by volume** (average 40 KB transactional message):
+
+  | Messages/day | Archive per day | Archive retention that fits 8 GB | Log retention that fits 3 GB DB |
+  |---|---|---|---|
+  | 1,000 | 40 MB | 180 days | 90 days or more |
+  | 5,000 | 200 MB | 30–40 days | 60 days |
+  | 20,000 | 800 MB | 7–10 days | 14–21 days (or `MC_ARCHIVE_INDEX_BODY_BYTES=512`) |
+
+* **Alerts:**
+  - Monitoring turns **Attention** at 80 % of `MC_ARCHIVE_MAX_GB` and
+    **Action needed** at the limit.
+  - Nothing is deleted before its retention period. At the limit, captures
+    wait, and then are skipped with a record.
+  - Plan for the first alert by shortening archive retention in Settings
+    (applied within an hour) or adding disk.
+* **Monthly check:**
+  ```bash
+  df -h /
+  sudo du -sh /var/spool/postfix /var/lib/mail-console /var/spool/mail-console
+  sudo mail-console archive status
+  ```
 
 ## Encryption at rest
 
