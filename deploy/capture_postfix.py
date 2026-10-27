@@ -373,6 +373,7 @@ def foreign_references(pf, state: dict) -> list[str]:
     captured one after apply).
     """
     token = re.compile(rf"(?<![\w-])(?:{re.escape(ARCHIVE_SERVICE)}|{re.escape(PIPE_SERVICE)})(?![\w-])")
+    map_path = MAP_REF.partition(":")[2]   # finish deletes this file; any other use of it must go first
     services = parse_services(pf.master_lines(), pf.service_params())
     found = []
     for (name, type_), svc in services.items():
@@ -381,12 +382,15 @@ def foreign_references(pf, state: dict) -> list[str]:
         if state.get("phase") == "applied" and type_ == "inet" and name in state["listeners"]:
             continue   # ours until phase 1 restores it
         for param, value in svc.params.items():
-            if token.search(value):
+            if token.search(value) or map_path in value:
                 found.append(f"{name}/{type_} -o {param}={value}")
     for line in pf.main_explicit().splitlines():
         key, _, value = line.partition("=")
-        if key.strip() != LIMIT_PARAM and token.search(value):
-            found.append(f"main.cf {key.strip()} = {value.strip()}")
+        key, value = key.strip(), value.strip()
+        if key == "transport_maps":
+            value = _without_map_ref(value)   # our own entry is expected there
+        if key != LIMIT_PARAM and (token.search(value) or map_path in value):
+            found.append(f"main.cf {key} = {value}")
     return found
 
 
@@ -478,8 +482,8 @@ def apply(pf, plan: Plan, state_file: str = STATE_FILE, backup_root: str = BACKU
         "base": plan.base.name, "base_fields": plan.base.fields,
         "transport_maps": plan.transport_maps_before or None,
         "transport_maps_explicit": "transport_maps" in _explicit_names(pf.main_explicit()),
-        "limit_explicit": LIMIT_PARAM in _explicit_names(pf.main_explicit()),
-        "limit": pf.main_value(LIMIT_PARAM) if LIMIT_PARAM in _explicit_names(pf.main_explicit()) else None,
+        "limit_explicit": pf.main_cf_value(LIMIT_PARAM) is not None,   # postconf -n hides it without the pipe
+        "limit": pf.main_cf_value(LIMIT_PARAM),
         "map_existed": os.path.exists(MAP_FILE),
         "map_previous": pf.read_map(),
         "phase": "applied",
@@ -586,6 +590,10 @@ def finish(pf, state_file: str = STATE_FILE, force: bool = False) -> dict:
         if queued:
             raise PlanError(f"{queued} queued message(s) still carry the archive copy; removing the archive route "
                             "now could send them elsewhere. Wait until 'postqueue -j' shows none, then retry.")
+    current = pf.main_value("transport_maps")
+    remaining = _without_map_ref(current)
+    if MAP_REF in _entries(remaining):
+        raise PlanError(f"could not remove {MAP_REF} from transport_maps ({current}); nothing changed")
     # The limit first: postconf hides it once the pipe service is gone. Decide from main.cf itself.
     if pf.main_cf_value(LIMIT_PARAM) == "1":
         if state["limit_explicit"]:
@@ -598,9 +606,7 @@ def finish(pf, state_file: str = STATE_FILE, force: bool = False) -> dict:
         except RuntimeError:
             pass
     # Remove only our map from the *current* transport_maps; later edits stay.
-    current = pf.main_value("transport_maps")
     if MAP_REF in _entries(current):
-        remaining = _without_map_ref(current)
         if _entries(remaining) == _entries(state["transport_maps"]):
             if state["transport_maps_explicit"]:
                 pf.set_main("transport_maps", state["transport_maps"] or "")   # exact previous text
@@ -623,8 +629,11 @@ def _entries(value: str | None) -> list[str]:
 
 def _without_map_ref(value: str) -> str:
     """value with our map reference removed as literal text (other tables, e.g. inline:{..}, untouched)."""
-    out = re.sub(rf"(^|[\s,])\s*{re.escape(MAP_REF)}(?=[\s,]|$)[\s,]*", r"\1", value.strip())
-    return out.strip(" ,\t")
+    pattern = re.compile(rf"(^|[\s,])\s*{re.escape(MAP_REF)}(?=[\s,]|$)[\s,]*")
+    out, previous = value.strip(), None
+    while out != previous:   # adjacent copies share a separator; repeat until none is left
+        previous, out = out, pattern.sub(r"\1", out).strip(" ,\t")
+    return out
 
 
 def main(argv: list[str] | None = None, pf=None) -> int:

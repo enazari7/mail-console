@@ -49,8 +49,13 @@ def test_no_docker_and_no_mail_service_mutation():
         # The only Postfix path allowed: an existence test of the capture state file (read-only).
         state_line = "CAPTURE_STATE=/etc/postfix/mailconsole-capture.json\n"
         if state_line in text:
-            uses = re.findall(r".*\$CAPTURE_STATE.*", text)
-            assert uses and all('[ -e "$CAPTURE_STATE" ]' in u or "echo" in u for u in uses), (path, uses)
+            uses = re.findall(r".*\$\{?CAPTURE_STATE\}?.*", text)
+            for use in uses:
+                use = use.strip()
+                existence_test = re.fullmatch(r'if \[ -e "\$CAPTURE_STATE" \](?: && \[ [^]]* \])?; then', use)
+                message = re.fullmatch(r'echo "[^"]*\(\$CAPTURE_STATE\)[^"]*" >&2', use)
+                assert existence_test or message, (path, use)
+            assert uses, path
             text = text.replace(state_line, "")
         assert "/etc/postfix" not in text and "/var/spool/postfix" not in text, path
 

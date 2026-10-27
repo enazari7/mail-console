@@ -456,3 +456,36 @@ def test_main_cf_value_reads_the_file(tmp_path):
     (tmp_path / "main.cf").write_text(f"# x\n{cp.LIMIT_PARAM} = 7\n{cp.LIMIT_PARAM}=1\nother = 2\n")
     assert cp.Postfix(config_dir=str(tmp_path)).main_cf_value(cp.LIMIT_PARAM) == "1"
     assert cp.Postfix(config_dir=str(tmp_path)).main_cf_value("missing") is None
+
+
+# --- third review regressions --------------------------------------------------------
+
+def test_every_copy_of_our_map_reference_is_removed():
+    r = cp.MAP_REF
+    for value, expected in ((f"{r},{r}, hash:/a", "hash:/a"), (f"{r}, {r}", ""), (f"hash:/a, {r} {r},hash:/b", "hash:/a,hash:/b"),
+                            (f"{r}, hash:/a", "hash:/a"), (f"hash:/a, {r}", "hash:/a")):
+        out = cp._without_map_ref(value)
+        assert out == expected and r not in out, (value, out)
+
+
+def test_finish_refuses_while_our_map_file_is_referenced_another_way(paths):
+    pf = applied(paths)
+    pf.main["transport_maps"] += f", proxy:{cp.MAP_REF}"        # admin edit after apply
+    warnings = cp.deactivate(pf, state_file=str(paths[0]))
+    assert any("transport_maps" in w for w in warnings)
+    with pytest.raises(cp.PlanError, match="still in use"):
+        cp.finish(pf, state_file=str(paths[0]))
+    assert cp.MAP_REF in pf.tables                               # map file kept
+    pf.main["transport_maps"] = pf.main["transport_maps"].replace(f", proxy:{cp.MAP_REF}", "")
+    cp.finish(pf, state_file=str(paths[0]))
+
+
+def test_preexisting_recipient_limit_is_restored(paths):
+    pf = FakePostfix(main={"transport_maps": "hash:/etc/postfix/transport", "smtpd_sasl_auth_enable": "no",
+                           cp.LIMIT_PARAM: "5"})
+    assert pf.main_value(cp.LIMIT_PARAM) == ""                  # hidden by postconf without the pipe service
+    applied(paths, pf)
+    assert json.loads(paths[0].read_text())["limit"] == "5"
+    cp.deactivate(pf, state_file=str(paths[0]))
+    cp.finish(pf, state_file=str(paths[0]))
+    assert pf.main[cp.LIMIT_PARAM] == "5"
