@@ -1,0 +1,54 @@
+[Unit]
+Description=BeastPing Mail Console - Postfix log collector (read-only)
+Documentation=https://github.com/enazari7/mail-console
+After=rsyslog.service systemd-journald.service
+
+[Service]
+Type=simple
+User=mailconsole
+Group=mailconsole
+# Read access to /var/log/syslog (group adm) and to the Postfix showq socket
+# for "postqueue -j" (group postdrop) is granted by the drop-in that
+# install.sh writes to mail-console-collector.service.d/10-groups.conf,
+# containing only groups that exist on this host.
+EnvironmentFile=/etc/mail-console/mail-console.env
+Environment=PYTHONPATH=/opt/mail-console/current PYTHONDONTWRITEBYTECODE=1
+WorkingDirectory=/opt/mail-console/current
+ExecStart=/opt/mail-console/current/venv/bin/python -m mailconsole collect
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+# Resource limits: lowest priority; mail delivery always wins.
+MemoryMax=512M
+TasksMax=32
+CPUWeight=20
+Nice=10
+IOSchedulingClass=idle
+
+# Sandbox: no network at all; only its own data directory is writable.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mail-console
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+[Install]
+WantedBy=multi-user.target

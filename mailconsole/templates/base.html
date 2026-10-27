@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en"{% if display.theme != "system" %} data-theme="{{ display.theme }}"{% endif %}>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+{% if refresh %}<meta http-equiv="refresh" content="30">{% endif %}
+<title>{% block title %}{% endblock %} · Mail Console</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css?v={{ version }}">
+</head>
+<body>
+{% if session %}
+<div class="shell">
+  <aside class="sidebar">
+    <a class="brand" href="/"><img src="/static/favicon.svg" alt="" width="22" height="22"><span>Mail Console</span></a>
+    {% set path = request.url.path %}
+    <nav>
+      <a href="/" class="{{ 'active' if path == '/' }}">Overview</a>
+      <a href="/emails" class="{{ 'active' if path.startswith('/emails') or path.startswith('/queue') }}">Emails</a>
+      <a href="/monitoring" class="{{ 'active' if path.startswith('/monitoring') }}">Monitoring</a>
+      <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">Settings</a>
+    </nav>
+    <div class="sidebar-foot">
+      <span class="muted small">{{ session.username }} · {{ display.tz_name }}</span>
+      <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link" type="submit">Sign out</button></form>
+    </div>
+  </aside>
+  <main class="content">
+    {% if schema_pending %}<div class="banner error">Database migrations pending: {{ schema_pending|join(", ") }}. Run <code>mail-console migrate</code>.</div>{% endif %}
+    {% if not collector_alive %}<div class="banner warn">The collector has not reported in the last 90 seconds. New log events are not being ingested. Check <code>systemctl status mail-console-collector</code>.</div>{% endif %}
+    {% block content %}{% endblock %}
+    <footer class="foot muted small">BeastPing Mail Console {{ version }} · times in {{ display.tz_name }} · read-only view of Postfix logs</footer>
+  </main>
+</div>
+{% else %}
+{% block public %}{% endblock %}
+{% endif %}
+</body>
+</html>

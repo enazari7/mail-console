@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies (hash-verified)
+        run: |
+          python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
+          python -m pip install -r requirements-dev.txt
+      - run: uname -m && python -c "import platform; print(platform.machine(), platform.python_version())"
+      - run: ruff check mailconsole tests deploy/smoke_test.py
+      - run: python -m pytest -p no:cacheprovider
+      - run: shellcheck -S warning deploy/*.sh scripts/*.sh
+
+  arm64-wheels:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: scripts/check-arm64-wheels.sh
+
+  deployment:
+    # Full install on a real systemd host without Docker, using the system
+    # Python 3.12 of Ubuntu 24.04, exactly as on the production server.
+    name: install + acceptance (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      ADMIN_PASSWORD: ci-only-password-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare a sanitized log file and configuration
+        run: |
+          sudo apt-get install -y --no-install-recommends python3.12-venv >/dev/null
+          sudo install -d -m 0755 /srv/ci
+          sudo install -m 0640 -o root -g adm tests/fixtures/syslog-iso.log /srv/ci/syslog
+          sudo install -d -m 0755 /etc/mail-console
+          sed -e 's#^MC_LOG_PATH=.*#MC_LOG_PATH=/srv/ci/syslog#' -e 's#^MC_POLL_INTERVAL=.*#MC_POLL_INTERVAL=1#' \
+            .env.example | sudo tee /etc/mail-console/mail-console.env >/dev/null
+      - name: install.sh
+        run: sudo ./deploy/install.sh
+      - name: Create administrator
+        run: echo "$ADMIN_PASSWORD" | sudo mail-console admin create --username admin --password-stdin
+      - name: Read-only check
+        run: sudo mail-console check || true
+      - name: Previously logged emails are visible
+        run: |
+          sleep 3
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin \
+            --expect 3F2A61C0D3 --expect alice@example.org --expect 2B4C6D8E0F --expect "<long-id@example.com>"
+      - name: New events appear without manual processing
+        run: |
+          echo "$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00) mail postfix/smtp[777]: C1A0000001: to=<live@example.org>, relay=mx.example.org[203.0.113.25]:25, delay=0.5, delays=0/0/0.2/0.3, dsn=2.0.0, status=sent (250 2.0.0 OK)" | sudo tee -a /srv/ci/syslog >/dev/null
+          sleep 4
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin --expect C1A0000001
+      - name: Restart keeps history
+        run: |
+          sudo systemctl restart mail-console-web mail-console-collector
+          sleep 3
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin \
+            --expect 3F2A61C0D3 --expect C1A0000001
+      - name: Log rotation is followed
+        run: |
+          sudo mv /srv/ci/syslog /srv/ci/syslog.1
+          echo "$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00) mail postfix/smtp[778]: C1A0000002: to=<late@example.org>, relay=none, delay=1, delays=0/0/1/0, dsn=4.4.1, status=deferred (connect to mx.example.org[203.0.113.25]:25: Connection timed out)" | sudo tee -a /srv/ci/syslog.1 >/dev/null
+          echo "$(date -u +%Y-%m-%dT%H:%M:%S.%6N+00:00) mail postfix/smtp[779]: C1A0000003: to=<rotated@example.org>, relay=mx.example.org[203.0.113.25]:25, delay=1, delays=0/0/1/0, dsn=2.0.0, status=sent (250 ok)" | sudo install -m 0640 -o root -g adm /dev/stdin /srv/ci/syslog
+          sleep 8
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin \
+            --expect C1A0000002 --expect C1A0000003
+      - name: Sandbox and binding
+        run: |
+          systemctl show mail-console-collector -p NoNewPrivileges -p ProtectSystem -p SupplementaryGroups -p User
+          systemd-analyze security --no-pager mail-console-web mail-console-collector | tail -n 3
+          ss -ltnp | grep 8710 | tee /dev/stderr | grep -q '127.0.0.1:8710'
+          sudo stat -c '%a %U:%G %n' /var/lib/mail-console /var/lib/mail-console/mail-console.sqlite3 /etc/mail-console/mail-console.env
+          test "$(sudo stat -c %a /var/lib/mail-console/mail-console.sqlite3)" = 600
+      - name: Update and rollback
+        run: |
+          sudo ./deploy/update.sh
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin --expect C1A0000003
+          sudo ./deploy/rollback.sh
+          sleep 3
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin --expect C1A0000003
+      - name: Uninstall
+        run: |
+          sudo ./deploy/uninstall.sh --purge
+          ! systemctl cat mail-console-web 2>/dev/null
+          test ! -e /opt/mail-console && test ! -e /var/lib/mail-console
+      - name: Service logs
+        if: failure()
+        run: sudo journalctl -u mail-console-web -u mail-console-collector --no-pager -n 200

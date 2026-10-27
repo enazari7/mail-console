@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% from "_macros.html" import pill, addr, qid, legend %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+{% set s = data.stats %}
+<header class="page-head">
+  <div>
+    <h1>Overview</h1>
+    <p class="muted">{{ rng.label }} · {{ display.ts(rng.start, "%Y-%m-%d %H:%M") }} – {{ display.ts(rng.end, "%Y-%m-%d %H:%M") }}</p>
+  </div>
+  <div class="range">
+    <nav class="seg" aria-label="Time range">
+      {% for key, label in [("1h", "1h"), ("24h", "24h"), ("7d", "7d"), ("30d", "30d"), ("90d", "90d")] %}
+      <a href="/?range={{ key }}" class="{{ 'active' if rng.key == key }}">{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <form method="get" action="/" class="inline">
+      <input type="hidden" name="range" value="custom">
+      <input type="datetime-local" name="start" value="{{ display.local_input(rng.start) }}" aria-label="From">
+      <input type="datetime-local" name="end" value="{{ display.local_input(rng.end) }}" aria-label="To">
+      <button class="btn" type="submit">Apply</button>
+    </form>
+    {% if refresh %}<a class="btn" href="/?range={{ rng.key }}">Stop auto-refresh</a>{% else %}<a class="btn" href="/?range={{ rng.key }}&amp;refresh=1">Auto-refresh</a>{% endif %}
+  </div>
+</header>
+
+<section class="tiles">
+  <div class="tile"><span class="tile-label">Accepted by next hop</span><span class="tile-value">{{ "{:,}".format(s.accepted) }}</span><span class="tile-sub muted">recipient deliveries with status=sent</span></div>
+  <div class="tile"><span class="tile-label">Deferrals</span><span class="tile-value">{{ "{:,}".format(s.deferral_events) }}</span><span class="tile-sub muted">{{ s.deferred_now }} recipient(s) currently deferred</span></div>
+  <div class="tile"><span class="tile-label">Bounced / failed</span><span class="tile-value">{{ "{:,}".format(s.failed) }}</span><span class="tile-sub muted">{{ s.bounced }} bounced · {{ s.expired }} expired · {{ s.rejected }} rejected</span></div>
+  <div class="tile"><span class="tile-label">Error rate</span><span class="tile-value">{% if s.error_rate is none %}—{% else %}{{ "%.1f"|format(s.error_rate * 100) }}%{% endif %}</span><span class="tile-sub muted">failed ÷ final outcomes ({{ s.outcomes }})</span></div>
+  <div class="tile"><span class="tile-label">Current queue</span>
+    {% if data.queue and data.queue.ok %}<span class="tile-value">{{ data.queue.total }}</span><span class="tile-sub muted">snapshot {{ ago(data.queue.ts) }}</span>
+    {% elif data.queue %}<span class="tile-value unknown">n/a</span><span class="tile-sub muted">{{ data.queue.error }}</span>
+    {% else %}<span class="tile-value unknown">n/a</span><span class="tile-sub muted">no snapshot yet</span>{% endif %}</div>
+  <div class="tile"><span class="tile-label">Messages received</span><span class="tile-value">{{ "{:,}".format(s.received) }}</span><span class="tile-sub muted">queue files created in range</span></div>
+</section>
+
+<section class="card">
+  <div class="card-head"><h2>SMTP activity</h2>{{ legend() }}</div>
+  {{ chart }}
+  <details class="table-view"><summary>Show as table</summary>
+    <table class="data compact"><thead><tr><th>Period start</th><th class="num">Accepted</th><th class="num">Deferred</th><th class="num">Failed</th></tr></thead>
+    <tbody>{% for b in data.buckets %}{% if b.accepted or b.deferred or b.failed %}<tr><td>{{ display.ts(b.start, "%Y-%m-%d %H:%M") }}</td><td class="num">{{ b.accepted }}</td><td class="num">{{ b.deferred }}</td><td class="num">{{ b.failed }}</td></tr>{% endif %}{% else %}<tr><td colspan="4" class="muted">No data</td></tr>{% endfor %}</tbody></table>
+  </details>
+  <p class="muted small">"Accepted" means the receiving server answered SMTP 2xx (Postfix <code>status=sent</code>). It does not prove inbox placement, opening or reading; this console has no open or click tracking.</p>
+</section>
+
+<div class="grid-2">
+  <section class="card">
+    <div class="card-head"><h2>Destination domains</h2><span class="muted small">top 10 by recipients</span></div>
+    {{ domain_chart }}
+    {% if data.domains %}<p class="small">Filter emails by domain:</p>
+    <p class="chips">{% for d in data.domains %}<a class="chip" href="/emails?domain={{ d.domain|urlencode }}">{{ d.domain }}</a>{% endfor %}</p>{% endif %}
+  </section>
+  <section class="card">
+    <div class="card-head"><h2>Queue size</h2><span class="muted small">last 24 hours</span></div>
+    {{ queue_chart }}
+    {% if data.queue and data.queue.ok %}
+    <p class="small">{% for name, n in data.queue.by_queue.items() %}<span class="chip">{{ name }}: {{ n }}</span>{% else %}<span class="muted">Queue is empty.</span>{% endfor %}</p>
+    {% endif %}
+    <p class="small"><a href="/monitoring">Open monitoring</a></p>
+  </section>
+</div>
+
+<section class="card">
+  <div class="card-head"><h2>Recent problems</h2><a class="small" href="/emails?status=failed">All failures</a></div>
+  <div class="table-wrap"><table class="data">
+    <thead><tr><th>Time</th><th>Recipient</th><th>Status</th><th>DSN</th><th>Response</th><th>Queue ID</th></tr></thead>
+    <tbody>
+    {% for f in data.recent_failures %}
+      <tr><td class="nowrap">{{ display.ts(f.ts) }}</td><td>{{ addr(f.address) }}</td><td>{{ pill(f.status) }}</td><td class="mono">{{ f.dsn or "—" }}</td><td class="resp" title="{{ f.response or '' }}">{{ f.response|summarize }}</td><td>{{ qid(f.queue_id, f.id) }}</td></tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No deferrals or failures in this range.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+</section>
+{% endblock %}
