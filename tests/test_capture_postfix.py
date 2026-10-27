@@ -33,6 +33,7 @@ class FakePostfix:
         self.map_written = None
         self.checks = 0
         self.queued_archive = 0
+        self.running = []
 
     def _load(self, line):
         parts = line.split()
@@ -64,7 +65,16 @@ class FakePostfix:
                        for k, v in self.params[(n, t)].items())
 
     def main_value(self, name):
+        # like postconf -h: a transport-specific parameter is unknown once its service is gone
+        if name.startswith(cp.PIPE_SERVICE + "_") and (cp.PIPE_SERVICE, "unix") not in self.services:
+            return ""
         return self.main.get(name, "")
+
+    def main_cf_value(self, name):
+        return self.main.get(name)
+
+    def processes(self):
+        return list(self.running)
 
     def main_expanded(self, name):
         value = self.main.get(name, "")
@@ -341,3 +351,108 @@ def test_existing_map_file_is_restored(paths):
     cp.deactivate(pf, state_file=str(paths[0]))
     cp.finish(pf, state_file=str(paths[0]))
     assert pf.map_written == "# operator's own content\n"
+
+
+# --- second review regressions -------------------------------------------------------
+
+def test_recipient_limit_is_removed_although_postconf_hides_it(paths):
+    pf = applied(paths)
+    assert pf.main[cp.LIMIT_PARAM] == "1"
+    cp.deactivate(pf, state_file=str(paths[0]))
+    cp.finish(pf, state_file=str(paths[0]))
+    assert cp.LIMIT_PARAM not in pf.main      # main.cf itself, not what postconf -h shows
+
+
+def test_rollback_after_failed_apply_removes_the_limit(paths):
+    pf = FakePostfix(main={"transport_maps": "hash:/etc/postfix/transport", "smtpd_sasl_auth_enable": "no",
+                           "virtual_alias_maps": "hash:/etc/postfix/virtual"},
+                     tables={"hash:/etc/postfix/transport": {},
+                             "hash:/etc/postfix/virtual": {cp.ARCHIVE_ADDRESS: "elsewhere@example.org"}})
+    with pytest.raises(cp.PlanError):
+        applied(paths, pf)
+    assert cp.LIMIT_PARAM not in pf.main
+
+
+def test_finish_refuses_while_another_service_uses_cleanup_archive(paths):
+    pf = applied(paths)
+    # An admin copied the captured listener (with its override) to a new IPv6 listener after apply.
+    pf.set_service("[2001:db8::1]:submission", "inet",
+                   "[2001:db8::1]:submission inet n - y - - smtpd -o smtpd_sasl_auth_enable=yes "
+                   "-o cleanup_service_name=cleanup-archive")
+    warnings = cp.deactivate(pf, state_file=str(paths[0]))
+    assert any("[2001:db8::1]:submission/inet" in w for w in warnings)
+    with pytest.raises(cp.PlanError, match=r"still in use.*2001:db8::1"):
+        cp.finish(pf, state_file=str(paths[0]))
+    assert ("cleanup-archive", "unix") in pf.services          # nothing removed
+    pf.remove_service_param("[2001:db8::1]:submission", "inet", "cleanup_service_name")
+    cp.finish(pf, state_file=str(paths[0]))
+
+
+def test_finish_refuses_a_main_cf_reference_to_the_pipe(paths):
+    pf = applied(paths)
+    pf.main["content_filter"] = "mailconsole-archive:dummy"
+    cp.deactivate(pf, state_file=str(paths[0]))
+    with pytest.raises(cp.PlanError, match="content_filter"):
+        cp.finish(pf, state_file=str(paths[0]))
+
+
+def test_finish_refuses_while_processes_still_use_cleanup_archive(paths):
+    pf = applied(paths)
+    cp.deactivate(pf, state_file=str(paths[0]))
+    # 'postfix reload' not run yet, or a long SMTP session from before it.
+    pf.running = ["smtpd -n 91.107.182.219:submission -t inet -u -c -o cleanup_service_name=cleanup-archive"]
+    with pytest.raises(cp.PlanError, match="running Postfix process"):
+        cp.finish(pf, state_file=str(paths[0]))
+    pf.running = ["cleanup -z -n cleanup-archive -t unix -u -c -o always_bcc=archive@mail-console.invalid"]
+    with pytest.raises(cp.PlanError, match="running Postfix process"):
+        cp.finish(pf, state_file=str(paths[0]))
+    pf.running = ["cleanup -z -t unix -u -c", "smtpd -n 127.0.0.1:submission -t inet -u -c"]
+    cp.finish(pf, state_file=str(paths[0]))
+
+
+def test_finish_does_not_bring_back_a_map_removed_after_apply(paths):
+    pf = applied(paths)
+    pf.main["transport_maps"] = cp.MAP_REF            # admin dropped hash:/etc/postfix/transport on purpose
+    cp.deactivate(pf, state_file=str(paths[0]))
+    cp.finish(pf, state_file=str(paths[0]))
+    assert pf.main["transport_maps"] == ""
+
+
+def test_finish_leaves_other_tables_byte_for_byte(paths):
+    inline = "inline:{ a@example.com=discard:, b@example.com=bouncecoll: }"
+    pf = FakePostfix(main={"transport_maps": inline, "smtpd_sasl_auth_enable": "no"})
+    applied(paths, pf)
+    pf.main["transport_maps"] += ", hash:/etc/postfix/later"
+    cp.deactivate(pf, state_file=str(paths[0]))
+    cp.finish(pf, state_file=str(paths[0]))
+    assert pf.main["transport_maps"] == inline + ", hash:/etc/postfix/later"
+
+
+def test_no_address_mappings_is_refused_and_detected():
+    with pytest.raises(cp.PlanError, match="no_address_mappings"):
+        cp.make_plan(FakePostfix(main={"transport_maps": "", "receive_override_options": "no_address_mappings"}), [])
+    master = PRODUCTION_MASTER.replace("-o milter_macro_daemon_name=ORIGINATING\n127.0.0.1",
+                                       "-o milter_macro_daemon_name=ORIGINATING "
+                                       "-o receive_override_options=no_header_body_checks,no_address_mappings\n"
+                                       "127.0.0.1", 1)
+    with pytest.raises(cp.PlanError, match="no_address_mappings"):
+        cp.make_plan(FakePostfix(master), [])
+
+
+def test_verify_reports_no_address_mappings_added_after_apply(paths):
+    pf = applied(paths)
+    pf.main["receive_override_options"] = "no_address_mappings"
+    assert any("no_address_mappings" in p for p in cp.verify(pf, json.loads(paths[0].read_text())))
+
+
+def test_command_line_offers_no_force(paths, monkeypatch, capsys):
+    monkeypatch.setattr(cp.os, "geteuid", lambda: 0)
+    with pytest.raises(SystemExit):
+        cp.main(["deactivate", "--finish", "--force"], pf=FakePostfix())
+    assert "unrecognized arguments: --force" in capsys.readouterr().err
+
+
+def test_main_cf_value_reads_the_file(tmp_path):
+    (tmp_path / "main.cf").write_text(f"# x\n{cp.LIMIT_PARAM} = 7\n{cp.LIMIT_PARAM}=1\nother = 2\n")
+    assert cp.Postfix(config_dir=str(tmp_path)).main_cf_value(cp.LIMIT_PARAM) == "1"
+    assert cp.Postfix(config_dir=str(tmp_path)).main_cf_value("missing") is None

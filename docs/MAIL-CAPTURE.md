@@ -102,6 +102,9 @@ never called by install, update, rollback or uninstall. What it does:
    25, so inbound mail is never captured. It also refuses when an
    `always_bcc` is already in use, because that copy would otherwise be
    replaced, and when `trivial-rewrite` has its own `transport_maps`.
+   `receive_override_options=no_address_mappings` (global, on the listener or
+   on the cleanup service) is refused too, because it switches off
+   `always_bcc` and nothing would be captured.
 2. **Mirrors the cleanup service** the listener uses today. On Ubuntu that is
    `cleanup unix n - y - 0 cleanup`: chroot `y`, plus any `-o` options it
    has. `cleanup-archive` becomes an exact copy with only its name changed,
@@ -127,6 +130,7 @@ never called by install, update, rollback or uninstall. What it does:
    - the first `transport_maps` hit for `archive@mail-console.invalid` is
      `mailconsole-archive:`;
    - no `virtual_alias_maps` or canonical map rewrites the address;
+   - `no_address_mappings` does not switch off `always_bcc`;
    - `mail-console.invalid` is not a local, virtual or relay domain.
 
      Together these mean the archive copy can only go to the internal pipe
@@ -221,28 +225,49 @@ sudo python3 -I /opt/mail-console/current/deploy/capture_postfix.py deactivate -
 sudo postfix reload
 ```
 
-* **`--finish` refuses** while `postqueue -j` shows any queued message with
-  the archive recipient.
+* **`--finish` refuses**, and changes nothing, while any of these is true.
+  Run it again later; there is no option to skip the checks.
+  - `postqueue -j` shows a queued message that still carries the archive
+    recipient. Removing the route then would send that copy to the default
+    route or a relayhost.
+  - A running Postfix process still uses `cleanup-archive`: `postfix reload`
+    was not run after phase 1, or an SMTP session from before the reload is
+    still open.
+  - Any other `master.cf` service or `main.cf` parameter still refers to
+    `cleanup-archive` or `mailconsole-archive`, for example a listener copied
+    from the captured one after `apply`. Removing the services would make that
+    listener temp-fail all mail. Phase 1 already warns about these.
 * **Only Mail Console's own changes are removed**, from the *current*
   configuration:
   - the `mailconsole_transport` entry is removed from `transport_maps`; maps
     added by an administrator after `apply` (for example for the bounce
     collector) stay;
-  - the recipient limit is reset only if it still has Mail Console's value;
+  - the recipient limit is reset only if `main.cf` still has Mail Console's
+    value. It is read from the file itself, because `postconf` hides this
+    parameter once the pipe service is gone;
+  - if an administrator removed the other maps after `apply`, they are not
+    brought back; other table references (including `inline:{…}`) are kept
+    as written;
   - a map file that existed before `apply` is written back.
 * **Manual listener edits:** if the listener was edited by hand in between,
   `deactivate` restores `cleanup_service_name`, reports the other edits as
   warnings and leaves them alone.
 * **Tested exact restore:** without later edits the result is identical to
-  the pre-`apply` configuration. CI compares `postconf -n`, `postconf -M` and
-  `postconf -P` before `apply` and after `deactivate --finish`.
+  the pre-`apply` configuration. CI holds one archive copy in the queue,
+  checks that `--finish` refuses, delivers the copy and finishes. It then
+  compares `postconf -n`, `postconf -M`, `postconf -P` and `main.cf` (byte for
+  byte) with the state before `apply`, and checks that `postconf` prints no
+  warning about a leftover parameter.
 
 Do this before uninstalling Mail Console or rolling back to a release
-without capture. If capture is still active then:
+without capture. While `/etc/postfix/mailconsole-capture.json` exists (capture
+applied, or only phase 1 done):
 
-- a normal uninstall keeps the wrapper `/usr/local/libexec/mail-console/mc-capture`;
-- the wrapper defers archive copies (exit 75) instead of losing them;
-- `--purge` removes the wrapper.
+- `uninstall.sh` refuses, and `rollback.sh` refuses to go back to a release
+  without capture. `--force` overrides this.
+- If forced, a normal uninstall keeps the wrapper
+  `/usr/local/libexec/mail-console/mc-capture`, which defers archive copies
+  (exit 75) instead of losing them; `--purge` removes the wrapper.
 
 ## Verification after activation
 
@@ -432,7 +457,9 @@ then add:
 ```bash
 echo '@beastping.com archive@mail-console.invalid' | sudo tee /etc/postfix/mailconsole_sender_bcc
 sudo postmap /etc/postfix/mailconsole_sender_bcc
-sudo postconf -e "sender_bcc_maps = hash:/etc/postfix/mailconsole_sender_bcc"
+# prepend, keeping an existing sender_bcc_maps (first match wins: check it has no entry for @beastping.com senders)
+CUR="$(postconf -h sender_bcc_maps)"
+sudo postconf -e "sender_bcc_maps = hash:/etc/postfix/mailconsole_sender_bcc${CUR:+, $CUR}"
 ```
 
 Trade-off: this is keyed by envelope sender, so it also archives any

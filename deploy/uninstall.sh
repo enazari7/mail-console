@@ -2,11 +2,26 @@
 # Remove BeastPing Mail Console.
 #   sudo ./deploy/uninstall.sh          # remove code and units; keep config and data
 #   sudo ./deploy/uninstall.sh --purge  # also delete config, database and the service user
+#   --force: continue although Postfix capture is still applied
 # Mail delivery services are not touched.
 set -euo pipefail
+CAPTURE_STATE=/etc/postfix/mailconsole-capture.json
 PURGE=0
-[ "${1:-}" = "--purge" ] && PURGE=1
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --purge) PURGE=1 ;;
+    --force) FORCE=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+if [ -e "$CAPTURE_STATE" ] && [ "$FORCE" -eq 0 ]; then
+  echo "refusing: Postfix capture is still applied ($CAPTURE_STATE). Archive copies would be deferred" >&2
+  echo "          (or, with --purge, lost). Deactivate it first (docs/MAIL-CAPTURE.md, both phases)," >&2
+  echo "          or pass --force. Nothing changed." >&2
+  exit 1
+fi
 
 for unit in mail-console-web.service mail-console-collector.service; do
   systemctl disable --now "$unit" 2>/dev/null || true

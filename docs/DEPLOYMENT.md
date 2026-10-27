@@ -177,6 +177,8 @@ sudo /usr/local/src/mail-console/deploy/rollback.sh --restore-db # code and pre-
 
 Use `--restore-db` when the newer release applied a migration the older code
 does not understand (`mail-console check` reports the schema state).
+Rolling back to a release without message capture is refused while Postfix
+capture is applied; deactivate it first ([MAIL-CAPTURE.md](MAIL-CAPTURE.md)).
 
 Rolling back from the EMAILS-UX-02 release without `--restore-db` is safe: the
 older code ignores the new tables. It does not maintain the search index; when
@@ -194,8 +196,9 @@ sudo /usr/local/src/mail-console/deploy/uninstall.sh          # keep config and 
 sudo /usr/local/src/mail-console/deploy/uninstall.sh --purge  # also delete them and the user
 ```
 
-Uninstall stops and removes only the two console units, the wrapper and
-`/opt/mail-console`. Mail delivery is unaffected at every step; stopping the
+Uninstall is refused while Postfix capture is applied; deactivate it first
+([MAIL-CAPTURE.md](MAIL-CAPTURE.md)). It stops and removes only the two console
+units, the wrapper and `/opt/mail-console`. Mail delivery is unaffected at every step; stopping the
 console never affects Postfix.
 
 ## Operations

@@ -120,6 +120,25 @@ class Postfix:
     def main_explicit(self) -> str:
         return self._run(self.postconf, "-n")
 
+    def main_cf_value(self, name: str) -> str | None:
+        """The value written in main.cf, read from the file itself.
+
+        ``postconf -h``/``-n`` hide a transport-specific parameter once its
+        master.cf service is gone, so they cannot be used to clean it up.
+        """
+        found = None
+        pattern = re.compile(rf"^{re.escape(name)}\s*=\s*(.*?)\s*$")
+        with open(os.path.join(self.config_dir, "main.cf")) as fh:
+            for line in fh:
+                m = pattern.match(line)
+                if m:
+                    found = m.group(1)   # last one wins, as in Postfix
+        return found
+
+    def processes(self) -> list[str]:
+        """Command lines of running processes (master passes -n NAME and -o options to children)."""
+        return self._run("/usr/bin/ps", "-eo", "args=").splitlines()
+
     def archive_copies_queued(self) -> int:
         """Queued messages that still carry the archive recipient."""
         out = self._run("/usr/sbin/postqueue", "-j")
@@ -315,6 +334,10 @@ def make_plan(pf, requested: list[str], allow_other_port: bool = False) -> Plan:
     if pf.main_value("always_bcc") or base.params.get("always_bcc"):
         raise PlanError("always_bcc is already in use (main.cf or the base cleanup service); the archive copy "
                         "would replace it. Use sender_bcc_maps for capture instead, or remove always_bcc first.")
+    blocked = _bcc_disabled(pf.main_value("receive_override_options"), base.params, listeners)
+    if blocked:
+        raise PlanError(f"receive_override_options contains no_address_mappings ({blocked}); that turns off "
+                        "always_bcc, so nothing would be captured. Adjust the plan by hand.")
     for svc in services.values():
         if svc.command == "trivial-rewrite" and "transport_maps" in svc.params:
             raise PlanError(f"{svc.name}/{svc.type} overrides transport_maps; the archive route would not be "
@@ -329,6 +352,42 @@ def make_plan(pf, requested: list[str], allow_other_port: bool = False) -> Plan:
             f"{default_transport}. The archive copy is always routed by the first transport map entry, and "
             "'deactivate --finish' refuses to remove that route while archive copies are still queued.")
     return plan
+
+
+def _bcc_disabled(global_value: str, base_params: dict, listeners) -> str:
+    """Where receive_override_options=...no_address_mappings would suppress always_bcc ('' if nowhere)."""
+    def off(value):
+        return "no_address_mappings" in re.split(r"[\s,]+", value or "")
+    where = [f"{s.name}/inet" for s in listeners
+             if off(s.params.get("receive_override_options", global_value))]
+    if off(base_params.get("receive_override_options")):
+        where.append("cleanup service")
+    return ", ".join(where)
+
+
+def foreign_references(pf, state: dict) -> list[str]:
+    """Configuration outside our own entries that still points at cleanup-archive or the pipe.
+
+    Removing the two services while such a reference exists would make that
+    service temp-fail every message (for example a listener copied from the
+    captured one after apply).
+    """
+    token = re.compile(rf"(?<![\w-])(?:{re.escape(ARCHIVE_SERVICE)}|{re.escape(PIPE_SERVICE)})(?![\w-])")
+    services = parse_services(pf.master_lines(), pf.service_params())
+    found = []
+    for (name, type_), svc in services.items():
+        if (name, type_) in ((ARCHIVE_SERVICE, "unix"), (PIPE_SERVICE, "unix")):
+            continue
+        if state.get("phase") == "applied" and type_ == "inet" and name in state["listeners"]:
+            continue   # ours until phase 1 restores it
+        for param, value in svc.params.items():
+            if token.search(value):
+                found.append(f"{name}/{type_} -o {param}={value}")
+    for line in pf.main_explicit().splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() != LIMIT_PARAM and token.search(value):
+            found.append(f"main.cf {key.strip()} = {value.strip()}")
+    return found
 
 
 def describe(pf, plan: Plan, out=sys.stdout) -> None:
@@ -374,6 +433,11 @@ def verify(pf, state: dict) -> list[str]:
         problems.append(f"{ARCHIVE_SERVICE}/unix lacks always_bcc={ARCHIVE_ADDRESS}")
     if (PIPE_SERVICE, "unix") not in services:
         problems.append(f"{PIPE_SERVICE}/unix missing")
+    blocked = _bcc_disabled(pf.main_value("receive_override_options"),
+                            archive.params if archive is not None else {},
+                            [services[(n, "inet")] for n in state["listeners"] if (n, "inet") in services])
+    if blocked:
+        problems.append(f"no_address_mappings in receive_override_options ({blocked}) turns off always_bcc")
     # The archive address must resolve to the internal pipe transport, first.
     maps = [m for m in re.split(r"[\s,]+", pf.main_expanded("transport_maps")) if m]
     first_hit = None
@@ -493,20 +557,41 @@ def deactivate(pf, state_file: str = STATE_FILE) -> list[str]:
         if now != was:
             warnings.append(f"{name}/inet has other options that were edited since apply; they were left as they are")
     state["phase"] = "listeners-restored"
+    for ref in foreign_references(pf, state):
+        warnings.append(f"{ref} still uses the archive services; change it before 'deactivate --finish'")
     _write_state(state_file, state)
     return warnings
 
 
 def finish(pf, state_file: str = STATE_FILE, force: bool = False) -> dict:
-    """Phase 2: remove the archive route, services and map once nothing is queued for the archive."""
+    """Phase 2: remove the archive route, services and map once nothing can still use them.
+
+    ``force`` is only for apply's own rollback, before any reload made the
+    change live; the command line does not offer it.
+    """
     state = _load_state(state_file)
     if state.get("phase") != "listeners-restored":
         raise PlanError("run 'deactivate' and 'postfix reload' first")
     if not force:
+        refs = foreign_references(pf, state)
+        if refs:
+            raise PlanError("still in use, removing the archive services would make these temp-fail all mail: "
+                            + "; ".join(refs))
+        live = [a for a in pf.processes()
+                if f"cleanup_service_name={ARCHIVE_SERVICE}" in a or re.search(rf"-n {re.escape(ARCHIVE_SERVICE)}\b", a)]
+        if live:
+            raise PlanError(f"{len(live)} running Postfix process(es) still use {ARCHIVE_SERVICE} (was 'postfix "
+                            "reload' run after 'deactivate'? long SMTP sessions end on their own). Retry shortly.")
         queued = pf.archive_copies_queued()
         if queued:
             raise PlanError(f"{queued} queued message(s) still carry the archive copy; removing the archive route "
                             "now could send them elsewhere. Wait until 'postqueue -j' shows none, then retry.")
+    # The limit first: postconf hides it once the pipe service is gone. Decide from main.cf itself.
+    if pf.main_cf_value(LIMIT_PARAM) == "1":
+        if state["limit_explicit"]:
+            pf.set_main(LIMIT_PARAM, state["limit"])
+        else:
+            pf.remove_main(LIMIT_PARAM)
     for name in (PIPE_SERVICE, ARCHIVE_SERVICE):
         try:
             pf.remove_service(name, "unix")
@@ -514,27 +599,15 @@ def finish(pf, state_file: str = STATE_FILE, force: bool = False) -> dict:
             pass
     # Remove only our map from the *current* transport_maps; later edits stay.
     current = pf.main_value("transport_maps")
-    entries = [e for e in re.split(r"[\s,]+", current.strip()) if e]
-    if MAP_REF in entries:
-        remaining = [e for e in entries if e != MAP_REF]
-        if remaining:
-            pf.set_main("transport_maps", state["transport_maps"] if remaining == _entries(state["transport_maps"])
-                        else ", ".join(remaining))
-        elif state["transport_maps_explicit"]:
-            pf.set_main("transport_maps", state["transport_maps"] or "")
-        else:
-            try:
+    if MAP_REF in _entries(current):
+        remaining = _without_map_ref(current)
+        if _entries(remaining) == _entries(state["transport_maps"]):
+            if state["transport_maps_explicit"]:
+                pf.set_main("transport_maps", state["transport_maps"] or "")   # exact previous text
+            else:
                 pf.remove_main("transport_maps")
-            except RuntimeError:
-                pass
-    if pf.main_value(LIMIT_PARAM) == "1":
-        if state["limit_explicit"]:
-            pf.set_main(LIMIT_PARAM, state["limit"])
         else:
-            try:
-                pf.remove_main(LIMIT_PARAM)
-            except RuntimeError:
-                pass
+            pf.set_main("transport_maps", remaining)   # edited since apply: keep exactly what the admin left
     if state.get("map_previous") is not None:
         pf.write_map(state["map_previous"])
     elif not state["map_existed"]:
@@ -548,6 +621,12 @@ def _entries(value: str | None) -> list[str]:
     return [e for e in re.split(r"[\s,]+", (value or "").strip()) if e]
 
 
+def _without_map_ref(value: str) -> str:
+    """value with our map reference removed as literal text (other tables, e.g. inline:{..}, untouched)."""
+    out = re.sub(rf"(^|[\s,])\s*{re.escape(MAP_REF)}(?=[\s,]|$)[\s,]*", r"\1", value.strip())
+    return out.strip(" ,\t")
+
+
 def main(argv: list[str] | None = None, pf=None) -> int:
     p = argparse.ArgumentParser(prog="capture_postfix.py", description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -559,7 +638,6 @@ def main(argv: list[str] | None = None, pf=None) -> int:
     deact = sub.add_parser("deactivate", help="phase 1: restore the listeners (then postfix reload); "
                                                "--finish: phase 2, remove the archive route once the queue is clear")
     deact.add_argument("--finish", action="store_true")
-    deact.add_argument("--force", action="store_true", help="with --finish: remove even if archive copies are queued")
     plan_p.add_argument("--allow-other-port", action="store_true", help=argparse.SUPPRESS)
     apply_p.add_argument("--allow-other-port", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("status", help="show the recorded state")
@@ -582,6 +660,8 @@ def main(argv: list[str] | None = None, pf=None) -> int:
                   f" (phase: {state.get('phase', 'applied')})")
             if state.get("phase") == "listeners-restored":
                 print(f"archive copies still queued: {pf.archive_copies_queued()}")
+                for ref in foreign_references(pf, state):
+                    print(f"still uses the archive services: {ref}")
                 return 0
             problems = verify(pf, state)
             print("verification: " + ("ok" if not problems else "; ".join(problems)))
@@ -603,7 +683,7 @@ def main(argv: list[str] | None = None, pf=None) -> int:
             print("then, once 'postqueue -j' holds no archive copies:  capture_postfix.py deactivate --finish")
             return 0
         if args.cmd == "deactivate":
-            finish(pf, force=args.force)
+            finish(pf)
             print("archive route, services and map removed; transport_maps keeps any later edits.")
             print("Activate with:  postfix reload")
             return 0

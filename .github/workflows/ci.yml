@@ -174,6 +174,7 @@ jobs:
       - name: Preflight and plan (read-only)
         run: |
           sudo postconf -n > /tmp/n.before; sudo postconf -M > /tmp/M.before; sudo postconf -P > /tmp/P.before
+          sudo cp /etc/postfix/main.cf /tmp/main.cf.before
           sudo ./deploy/capture-preflight.sh || [ $? -eq 2 ]
           sudo python3 -I deploy/capture_postfix.py plan | tee /tmp/plan.txt
           grep -q "$PUBLIC:submission/inet.*<- capture" /tmp/plan.txt
@@ -231,20 +232,53 @@ jobs:
           sleep 8
           test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 3
           test "$(sudo postqueue -j | wc -l)" = 0
-      - name: Deactivate restores the exact previous configuration
+      - name: Two-phase deactivation waits for queued copies and restores the exact previous configuration
         run: |
+          # Hold one archive copy in the queue, as after a capture outage.
+          sudo chmod 0000 /var/spool/mail-console/incoming
+          python3 scripts/send_test_mail.py --host "$PUBLIC" --port 587 --starttls --user app@ci.example.org \
+            --password ci-secret --to root@localhost --only-plain --tag HELD-CI
+          sleep 10
+          test "$(sudo postqueue -j | grep -c 'archive@mail-console.invalid')" = 1
+          # The process check in 'finish' relies on master passing -n NAME / -o options to its children.
+          sudo ps -eo args= | grep -E '[c]leanup_service_name=cleanup-archive|-n [c]leanup-archive'
           sudo python3 -I deploy/capture_postfix.py deactivate
           sudo postfix reload
-          sudo python3 -I deploy/capture_postfix.py status
-          sudo python3 -I deploy/capture_postfix.py deactivate --finish
+          sudo python3 -I deploy/capture_postfix.py status | tee /tmp/status.txt
+          grep -q "archive copies still queued: 1" /tmp/status.txt
+          # Phase 2 refuses while the copy is queued (after old children have exited following the reload).
+          for _ in $(seq 30); do
+            rc=0; sudo python3 -I deploy/capture_postfix.py deactivate --finish 2>/tmp/finish.err || rc=$?
+            grep -q "running Postfix process" /tmp/finish.err || break
+            sleep 2
+          done
+          cat /tmp/finish.err
+          test "$rc" = 2
+          grep -q "1 queued message(s) still carry the archive copy" /tmp/finish.err
+          ! sudo ps -eo args= | grep -E '[c]leanup_service_name=cleanup-archive'
+          # Deliver it to the archive, then finish.
+          sudo chmod 2770 /var/spool/mail-console/incoming
+          sudo postqueue -f     # CI only: retry the deferred archive copy now
+          sleep 8
+          test "$(sudo postqueue -j | wc -l)" = 0
+          for _ in $(seq 30); do
+            sudo python3 -I deploy/capture_postfix.py deactivate --finish && break
+            sleep 2
+          done
+          test ! -e /etc/postfix/mailconsole-capture.json
           sudo postfix reload
+          # Exact restore: postconf views, main.cf byte for byte, no leftover (even unused) parameter.
           sudo postconf -n | diff /tmp/n.before -
           sudo postconf -M | diff /tmp/M.before -
           sudo postconf -P | diff /tmp/P.before -
+          sudo diff /tmp/main.cf.before /etc/postfix/main.cf
+          test -z "$(sudo postconf -n 2>&1 >/dev/null)"
+          ! sudo grep -E 'cleanup-archive|mailconsole' /etc/postfix/main.cf /etc/postfix/master.cf
+          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 4
           python3 scripts/send_test_mail.py --host "$PUBLIC" --port 587 --starttls --user app@ci.example.org \
             --password ci-secret --to root@localhost --only-plain --tag AFTER-CI
           sleep 8
-          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 3
+          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 4
           sudo grep "status=sent" /var/log/postfix.log | tail -n 2
       - name: Logs
         if: failure()
