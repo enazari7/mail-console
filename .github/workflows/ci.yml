@@ -26,7 +26,7 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
           python -m pip install -r requirements-dev.txt
       - run: uname -m && python -c "import platform; print(platform.machine(), platform.python_version())"
-      - run: ruff check mailconsole tests deploy/smoke_test.py
+      - run: ruff check mailconsole tests scripts deploy/smoke_test.py
       - run: python -m pytest -p no:cacheprovider
       - run: shellcheck -S warning deploy/*.sh scripts/*.sh
 

@@ -100,3 +100,16 @@ def test_repository_contains_no_secrets_or_real_data():
             # (bare dotted codes such as Yahoo's "4.16.55.1" are not addresses).
             for ip in re.findall(r"(?:\[|from |address )(\d{1,3}\.\d{1,3}\.\d{1,3})\.\d{1,3}\b", text):
                 assert ip in ("192.0.2", "198.51.100", "203.0.113", "127.0.0"), (name, ip)
+
+
+def test_install_stops_console_before_migrating():
+    text = (DEPLOY / "install.sh").read_text()
+    stop = text.index('systemctl stop "${STOPPED[@]}"')
+    migrate_call = text.index('run_as_service "$DEST" migrate')
+    assert stop < migrate_call and "trap restart_previous EXIT" in text
+
+
+def test_example_env_sources_cleanly():
+    out = subprocess.run(["bash", "-c", "set -euo pipefail; set -a; . ./.env.example; set +a; echo \"$MC_MONITOR_UNITS\""],
+                         cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    assert "beastping-mailguard.service" in out and "postfix@-.service" in out

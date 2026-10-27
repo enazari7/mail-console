@@ -46,6 +46,8 @@ def connect(db_path: Path | str, *, readonly: bool = False) -> sqlite3.Connectio
         uri = f"file:{path}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, isolation_level=None, timeout=15.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Unicode-aware case folding for search (SQLite's lower() is ASCII-only).
+    conn.create_function("mc_fold", 1, lambda v: v.casefold() if isinstance(v, str) else v, deterministic=True)
     conn.execute("PRAGMA busy_timeout = 15000")
     conn.execute("PRAGMA foreign_keys = ON")
     if not readonly:
@@ -111,7 +113,24 @@ def migrate(conn: sqlite3.Connection) -> list[str]:
                 conn.execute("ROLLBACK")
             raise
         applied.append(name)
+        post = POST_MIGRATION.get(version)
+        if post:
+            post(conn)
+    if 2 in applied_versions(conn):
+        # Re-runnable completion of the search index: covers a post-migration
+        # step that was interrupted after its schema change was committed.
+        from .search import fill_missing
+        fill_missing(conn)
     return applied
+
+
+def _rebuild_search(conn: sqlite3.Connection) -> None:
+    from .search import rebuild
+    rebuild(conn)
+
+
+# Python steps that run once, right after the migration of the same version.
+POST_MIGRATION = {2: _rebuild_search}
 
 
 def pending_migrations(conn: sqlite3.Connection) -> list[str]:

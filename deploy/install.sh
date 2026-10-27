@@ -93,6 +93,27 @@ run_as_service() {
     "$1/venv/bin/python" -m mailconsole "${@:2}"
 }
 
+# --- stop the console (never the mail services) during backup and migration --
+# The running (older) release must not write to the database while the new
+# schema and search index are being built; it resumes from its checkpoint.
+STOPPED=()
+for unit in "${UNITS[@]}"; do
+  if systemctl is-active --quiet "$unit"; then
+    STOPPED+=("$unit")
+  fi
+done
+if [ "${#STOPPED[@]}" -gt 0 ]; then
+  log "stopping ${STOPPED[*]} for the database upgrade"
+  systemctl stop "${STOPPED[@]}"
+fi
+restart_previous() {
+  if [ "${#STOPPED[@]}" -gt 0 ] && [ -z "${SWITCHED:-}" ]; then
+    echo "==> install failed before switching releases; restarting the previous release" >&2
+    systemctl start "${STOPPED[@]}" || true
+  fi
+}
+trap restart_previous EXIT
+
 # --- database backup and migration -----------------------------------------
 DB=$(set -a; . "$ETC_DIR/mail-console.env"; set +a; echo "${MC_DB_PATH:-${MC_DATA_DIR:-$DATA_DIR}/mail-console.sqlite3}")
 if [ -f "$DB" ]; then
@@ -111,6 +132,7 @@ run_as_service "$DEST" migrate
 PREVIOUS=$(readlink "$PREFIX/current" 2>/dev/null || true)
 ln -sfn "releases/$RELEASE" "$PREFIX/current.new"
 mv -T "$PREFIX/current.new" "$PREFIX/current"
+SWITCHED=1
 [ -n "$PREVIOUS" ] && echo "$PREVIOUS" > "$PREFIX/previous"
 
 cat > /usr/local/sbin/mail-console <<'WRAPPER'
@@ -144,6 +166,9 @@ EOF
 systemctl daemon-reload
 systemctl enable "${UNITS[@]}" >/dev/null
 
+if [ "$START" -eq 0 ] && [ "${#STOPPED[@]}" -gt 0 ]; then
+  log "--no-start: ${STOPPED[*]} left stopped; start them with: systemctl start ${STOPPED[*]}"
+fi
 if [ "$START" -eq 1 ]; then
   log "restarting mail-console services"
   systemctl restart "${UNITS[@]}"

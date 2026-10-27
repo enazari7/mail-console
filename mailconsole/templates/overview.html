@@ -51,7 +51,7 @@
     <div class="card-head"><h2>Destination domains</h2><span class="muted small">top 10 by recipients</span></div>
     {{ domain_chart }}
     {% if data.domains %}<p class="small">Filter emails by domain:</p>
-    <p class="chips">{% for d in data.domains %}<a class="chip" href="/emails?domain={{ d.domain|urlencode }}">{{ d.domain }}</a>{% endfor %}</p>{% endif %}
+    <p class="chips">{% for d in data.domains %}{% if d.domain != "(none)" %}<a class="chip" href="{{ emails_link(domain=d.domain) }}">{{ d.domain }}</a>{% else %}<span class="chip" title="Recipients without a domain part">(none)</span>{% endif %}{% endfor %}</p>{% endif %}
   </section>
   <section class="card">
     <div class="card-head"><h2>Queue size</h2><span class="muted small">last 24 hours</span></div>
@@ -64,7 +64,7 @@
 </div>
 
 <section class="card">
-  <div class="card-head"><h2>Recent problems</h2><a class="small" href="/emails?status=failed">All failures</a></div>
+  <div class="card-head"><h2>Recent problems</h2><a class="small" href="{{ emails_link(status='failed') }}">All failures</a></div>
   <div class="table-wrap"><table class="data">
     <thead><tr><th>Time</th><th>Recipient</th><th>Status</th><th>DSN</th><th>Response</th><th>Queue ID</th></tr></thead>
     <tbody>

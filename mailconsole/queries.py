@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from . import search
 from .db import get_state
 
 US = 1_000_000
@@ -16,7 +17,7 @@ HOUR = 3600 * US
 DAY = 24 * HOUR
 
 STATUS_LABELS = {
-    "accepted": "Accepted",
+    "accepted": "Accepted by destination",
     "deferred": "Deferred",
     "bounced": "Bounced",
     "expired": "Expired",
@@ -30,8 +31,9 @@ STATUS_LABELS = {
     "unknown": "Unknown",
 }
 STATUS_HELP = {
-    "accepted": "The next-hop server accepted the message (SMTP 2xx, status=sent). "
-                "This does not prove inbox placement, opening or reading.",
+    "accepted": "The next-hop SMTP server accepted the message (SMTP 2xx, Postfix status=sent). "
+                "This does not prove inbox placement, opening or reading, and a later asynchronous "
+                "bounce from the destination is not correlated here yet.",
     "deferred": "Temporary failure (4xx or connection problem). Postfix will retry until the queue lifetime ends.",
     "bounced": "Permanent failure (5xx). Postfix will not retry; a non-delivery notice may have been sent.",
     "expired": "Deferred until the maximum queue lifetime and then returned to the sender.",
@@ -47,8 +49,10 @@ STATUS_HELP = {
 STATUS_GROUPS = {
     "failed": ("bounced", "expired", "rejected"),
 }
-FILTER_STATUSES = ["accepted", "deferred", "bounced", "expired", "rejected", "failed", "queued", "processing",
-                   "removed", "unknown"]
+FILTER_STATUSES = ["queued", "processing", "deferred", "accepted", "bounced", "rejected", "expired", "partial",
+                   "unknown", "removed", "failed"]
+# Statuses that describe the whole message rather than one recipient.
+MESSAGE_LEVEL_STATUSES = {"partial", "processing"}
 
 
 # --- time ranges -----------------------------------------------------------
@@ -65,6 +69,7 @@ class TimeRange:
 RANGE_PRESETS = {
     "1h": (HOUR, 5 * 60 * US, "Last hour"),
     "24h": (DAY, HOUR, "Last 24 hours"),
+    "15d": (15 * DAY, DAY, "Last 15 days"),
     "7d": (7 * DAY, 6 * HOUR, "Last 7 days"),
     "30d": (30 * DAY, DAY, "Last 30 days"),
     "90d": (90 * DAY, DAY, "Last 90 days"),
@@ -182,20 +187,47 @@ def overview(conn: sqlite3.Connection, rng: TimeRange, tz: ZoneInfo) -> dict:
 
 # --- activity --------------------------------------------------------------
 
+MAX_COUNT = 10_000          # counts above this are shown as "10,000+"
+SORTS = {
+    "sent": "m.first_ts {d}, m.id {d}, r.id {d}",
+    "recipient": "r.address COLLATE NOCASE {d}, m.first_ts DESC, m.id DESC, r.id",
+    "status": "row_status {d}, m.first_ts DESC, m.id DESC, r.id",
+}
+ROW_COLUMNS = (
+    "m.id, m.queue_id, m.first_ts, m.last_ts, m.sender, m.subject, m.message_id, m.status AS message_status,"
+    " m.nrcpt, m.origin, r.address, r.domain, r.status AS recipient_status, r.dsn, r.response, r.relay,"
+    " r.attempts, coalesce(r.final_ts, r.last_attempt_ts) AS outcome_ts, m.last_response, m.last_dsn,"
+    " coalesce(r.status, m.status) AS row_status"
+)
+
+
 @dataclass
 class ActivityFilter:
     q: str = ""
     status: str = ""
     domain: str = ""
+    sender: str | None = None     # None = any sender; "" = null sender <>
     start: int | None = None
     end: int | None = None
+    sort: str = "sent"
+    direction: str = "desc"
+
+    @property
+    def term(self) -> str:
+        q = self.q.replace("\x00", "").strip()
+        return q[1:-1].strip() if q.startswith("<") and q.endswith(">") else q
+
+    @property
+    def short_term(self) -> bool:
+        return 0 < len(self.term) < search.MIN_SUBSTRING
 
 
-def _like(text: str) -> str:
-    return "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+def _row_text(prefix_cols: list[str]) -> str:
+    return "mc_fold(" + " || ' ' || ".join(f"coalesce({c}, '')" for c in prefix_cols) + ")"
 
 
 def _activity_where(f: ActivityFilter) -> tuple[str, list]:
+    """WHERE clause shared by the list, the count and the export. All values are bound parameters."""
     clauses, args = [], []
     if f.start is not None:
         clauses.append("m.first_ts >= ?")
@@ -204,40 +236,92 @@ def _activity_where(f: ActivityFilter) -> tuple[str, list]:
         clauses.append("m.first_ts < ?")
         args.append(f.end)
     if f.status:
-        statuses = STATUS_GROUPS.get(f.status, (f.status,))
-        clauses.append(f"coalesce(r.status, m.status) IN ({','.join('?' * len(statuses))})")
-        args.extend(statuses)
+        if f.status in MESSAGE_LEVEL_STATUSES:
+            clauses.append("m.status = ?")
+            args.append(f.status)
+        else:
+            statuses = STATUS_GROUPS.get(f.status, (f.status,))
+            clauses.append(f"coalesce(r.status, m.status) IN ({','.join('?' * len(statuses))})")
+            args.extend(statuses)
     if f.domain:
         clauses.append("r.domain = ?")
         args.append(f.domain.lower())
-    q = f.q.strip()
-    if q:
-        bare = q[1:-1] if q.startswith("<") and q.endswith(">") else q
-        like = _like(bare)
-        clauses.append(
-            "(m.queue_id = ? OR m.queue_id LIKE ? ESCAPE '\\' OR m.message_id LIKE ? ESCAPE '\\'"
-            " OR m.sender LIKE ? ESCAPE '\\' OR r.address LIKE ? ESCAPE '\\' OR r.orig_address LIKE ? ESCAPE '\\'"
-            " OR m.sasl_username LIKE ? ESCAPE '\\')"
-        )
-        args.extend([bare, bare.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%",
-                     like, like, like, like, like])
+    if f.sender is not None:
+        clauses.append("m.sender = ? COLLATE NOCASE")
+        args.append(f.sender)
+    term = f.term
+    if term and len(term) >= search.MIN_SUBSTRING:
+        # 1) indexed candidate messages from the trigram FTS index,
+        # 2) row-level check so a recipient row is shown only if the term is in
+        #    a message-wide field or in that recipient's own fields.
+        clauses.append("m.id IN (SELECT rowid FROM message_search WHERE message_search MATCH ?)")
+        args.append(search.phrase(term))
+        message_text = _row_text(["m.queue_id", "m.sender", "m.message_id", "m.subject", "m.sasl_username"])
+        recipient_text = _row_text(["r.address", "r.orig_address", "r.domain",
+                                    "CASE WHEN r.status != 'accepted' THEN r.response END"])
+        clauses.append(f"(instr({message_text}, ?) > 0 OR instr({recipient_text}, ?) > 0"
+                       " OR (r.id IS NULL AND instr(mc_fold(coalesce(m.last_response, '')), ?) > 0))")
+        args.extend([search.fold(term)] * 3)
+    elif term:
+        # Too short for substring search: exact, indexed matches only.
+        clauses.append("(m.queue_id = ? OR r.domain = ? OR r.address = ? COLLATE NOCASE)")
+        args.extend([term, term.lower(), term])
     return (" WHERE " + " AND ".join(clauses)) if clauses else "", args
+
+
+def _order(f: ActivityFilter) -> str:
+    direction = "ASC" if f.direction == "asc" else "DESC"
+    return SORTS.get(f.sort, SORTS["sent"]).format(d=direction)
+
+
+BASE_FROM = " FROM messages m LEFT JOIN recipients r ON r.message_id = m.id"
 
 
 def activity(conn: sqlite3.Connection, f: ActivityFilter, page: int, per_page: int) -> dict:
     where, args = _activity_where(f)
-    base = " FROM messages m LEFT JOIN recipients r ON r.message_id = m.id" + where
-    total = conn.execute("SELECT count(*)" + base, args).fetchone()[0]
+    total = conn.execute(f"SELECT count(*) FROM (SELECT 1{BASE_FROM}{where} LIMIT ?)",
+                         args + [MAX_COUNT + 1]).fetchone()[0]
+    capped = total > MAX_COUNT
+    total = min(total, MAX_COUNT)
     pages = max(1, -(-total // per_page))
     page = min(max(1, page), pages)
     rows = conn.execute(
-        "SELECT m.id, m.queue_id, m.first_ts, m.last_ts, m.sender, m.subject, m.status AS message_status, m.nrcpt,"
-        " m.origin, r.address, r.domain, r.status AS recipient_status, r.dsn, r.response, r.relay, r.attempts,"
-        " coalesce(r.final_ts, r.last_attempt_ts) AS outcome_ts, m.last_response, m.last_dsn" + base +
-        " ORDER BY m.first_ts DESC, m.id DESC, r.id LIMIT ? OFFSET ?",
+        f"SELECT {ROW_COLUMNS}{BASE_FROM}{where} ORDER BY {_order(f)} LIMIT ? OFFSET ?",
         args + [per_page, (page - 1) * per_page],
     ).fetchall()
-    return {"rows": [dict(r) for r in rows], "total": total, "page": page, "pages": pages, "per_page": per_page}
+    return {"rows": [dict(r) for r in rows], "total": total, "capped": capped, "page": page, "pages": pages,
+            "per_page": per_page}
+
+
+def export_rows(conn: sqlite3.Connection, f: ActivityFilter, limit: int):
+    """Yield up to ``limit`` rows of the filtered result set, in display order."""
+    where, args = _activity_where(f)
+    cur = conn.execute(f"SELECT {ROW_COLUMNS}{BASE_FROM}{where} ORDER BY {_order(f)} LIMIT ?", args + [limit])
+    while True:
+        batch = cur.fetchmany(500)
+        if not batch:
+            return
+        yield from batch
+
+
+def count_rows(conn: sqlite3.Connection, f: ActivityFilter, cap: int) -> int:
+    where, args = _activity_where(f)
+    return conn.execute(f"SELECT count(*) FROM (SELECT 1{BASE_FROM}{where} LIMIT ?)", args + [cap]).fetchone()[0]
+
+
+def senders(conn: sqlite3.Connection, start: int | None, end: int | None, limit: int = 100) -> list[dict]:
+    """Sender addresses seen in the range, most frequent first."""
+    clauses, args = ["sender IS NOT NULL", "queue_id IS NOT NULL"], []
+    if start is not None:
+        clauses.append("first_ts >= ?")
+        args.append(start)
+    if end is not None:
+        clauses.append("first_ts < ?")
+        args.append(end)
+    rows = conn.execute(
+        f"SELECT sender, count(*) AS n FROM messages WHERE {' AND '.join(clauses)}"
+        " GROUP BY sender ORDER BY n DESC, sender LIMIT ?", args + [limit]).fetchall()
+    return [dict(r) for r in rows]
 
 
 # --- details ---------------------------------------------------------------
@@ -297,10 +381,10 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
         if requeued_as:
             related.append({"relation": "Requeued as", "queue_id": requeued_as["queue_id"],
                             "id": requeued_as["id"], "status": requeued_as["status"]})
-        reuse = conn.execute("SELECT count(*) FROM messages WHERE queue_id = ? AND id != ?",
-                             (msg["queue_id"], message_id)).fetchone()[0]
+        reuse, reuse_first = conn.execute("SELECT count(*) - 1, min(first_ts) FROM messages WHERE queue_id = ?",
+                                          (msg["queue_id"],)).fetchone()
     else:
-        reuse = 0
+        reuse, reuse_first = 0, None
 
     gaps = []
     if not msg["has_start"] and msg["origin"] not in ("dsn",):
@@ -317,8 +401,24 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
     if msg["events_truncated"]:
         gaps.append("This message exceeded the per-message event limit; some retry events were not stored, so "
                     "retry counts are lower bounds.")
+    content = conn.execute("SELECT * FROM message_content WHERE message_id = ?", (message_id,)).fetchone()
+    if content is not None:
+        content = dict(content)
+        try:
+            content["attachments"] = json.loads(content["attachments"] or "[]")
+        except ValueError:
+            content["attachments"] = []
+    finals = [r["final_ts"] for r in recipients if r["final_ts"]]
+    summary = {
+        "attempts": sum(r["attempts"] for r in recipients),
+        "deferrals": sum(r["deferrals"] for r in recipients),
+        "final_ts": max(finals) if finals and len(finals) == len(recipients) else None,
+        "relays": sorted({r["relay"] for r in recipients if r["relay"]}),
+        "dsns": sorted({r["dsn"] for r in recipients if r["dsn"]}),
+    }
     return {"message": msg, "recipients": recipients, "events": events, "related": related,
-            "reuse_count": reuse, "gaps": gaps}
+            "reuse_count": reuse, "reuse_first_ts": reuse_first, "gaps": gaps, "content": content,
+            "summary": summary}
 
 
 def resolve_queue_id(conn: sqlite3.Connection, queue_id: str) -> int | None:

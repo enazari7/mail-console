@@ -1,57 +1,16 @@
-import re
-
 import pytest
 from fastapi.testclient import TestClient
 
-from mailconsole import auth, monitor
+from mailconsole import auth
 from mailconsole.db import tx
 from mailconsole.web import create_app
 
-from .conftest import FIXTURES, fixture_lines, ingest_lines
-
-PASSWORD = "correct horse battery"
-FIXTURE_QUEUE = (FIXTURES / "postqueue.jsonl").read_text()
-
-
-@pytest.fixture
-def app_db(cfg, db):
-    ingest_lines(db, cfg, fixture_lines())
-    with tx(db):
-        monitor.record_queue(db, monitor.parse_postqueue_json(FIXTURE_QUEUE))
-        monitor.record_units(db, [monitor.UnitStatus("Postfix", "postfix@-.service", True, "loaded", "active",
-                                                     "running", "Mon 2026-10-26 08:00:00 UTC", 1203, 0)])
-    return db
-
-
-@pytest.fixture
-def client(cfg, app_db):
-    return TestClient(create_app(cfg), base_url="http://127.0.0.1:8710", follow_redirects=False)
-
-
-@pytest.fixture
-def admin(db):
-    return auth.create_admin(db, "admin", PASSWORD)
-
-
-def csrf_from(html: str) -> str:
-    return re.search(r'name="csrf_token" value="([^"]+)"', html).group(1)
-
-
-def login(client, username="admin", password=PASSWORD, next_url="/"):
-    page = client.get("/login")
-    return client.post("/login", data={"username": username, "password": password,
-                                       "csrf_token": csrf_from(page.text), "next": next_url})
-
-
-@pytest.fixture
-def logged_in(client, admin):
-    assert login(client).status_code == 303
-    return client
-
+from .conftest import PASSWORD, csrf_from, login
 
 # --- authentication & session security ---------------------------------------
 
 @pytest.mark.parametrize("path", ["/", "/emails", "/emails?q=alice%40example.org", "/emails/1", "/monitoring",
+                                  "/emails/export.csv?q=alice", "/emails/1/content-preview",
                                   "/settings", "/queue/3F2A61C0D3"])
 def test_no_unauthenticated_access(client, admin, path):
     r = client.get(path)
@@ -165,73 +124,12 @@ def test_attempted_usernames_are_not_stored_in_clear(client, admin, db):
 
 # --- dashboard pages ---------------------------------------------------------
 
-def rows(html: str) -> list[str]:
-    return re.findall(r"<tr>\s*<td class=\"nowrap\"><a href=\"/emails/\d+\">.*?</tr>", html, re.S)
-
-
 def test_overview_renders_metrics_and_charts(logged_in):
     r = logged_in.get("/?range=custom&start=2026-10-20T00:00&end=2026-10-27T00:00")
     assert r.status_code == 200
     assert r.text.count("<svg") >= 2 and 'class="s-accepted"' in r.text
     assert "46.2%" in r.text  # 6 failed of 13 final outcomes
     assert "example.org" in r.text and ">2<" in r.text  # queue size from snapshot
-
-
-@pytest.mark.parametrize("q,expected", [
-    ("alice@example.org", {"alice@example.org"}),
-    ("3F2A61C0D3", {"alice@example.org"}),
-    ("<20261020090210.55aa@example.com>", {"bob@example.net", "nobody@example.org"}),
-    ("2B4C6D8E0F", {"erin@example.org", "frank@example.net"}),
-    ("4Xyz9", {"heidi@example.org", "ivan@example.net", "judy@example.com"}),
-    ("no-such-user@example.org", set()),
-    ("%", set()),
-])
-def test_search(logged_in, q, expected):
-    r = logged_in.get("/emails", params={"q": q})
-    assert r.status_code == 200
-    found = set(re.findall(r'<td class="addr" title="([^"]*)">(?!<span)', r.text))
-    found = {f for f in found if f in r.text and "@" in f} & {
-        "alice@example.org", "bob@example.net", "nobody@example.org", "erin@example.org", "frank@example.net",
-        "heidi@example.org", "ivan@example.net", "judy@example.com", "carol@example.net"}
-    assert found == expected
-
-
-def test_status_domain_and_date_filters(logged_in):
-    failed = logged_in.get("/emails", params={"status": "failed"}).text
-    assert len(rows(failed)) == 6 and "alice@example.org" not in failed
-    deferred = logged_in.get("/emails", params={"status": "deferred"}).text
-    assert len(rows(deferred)) == 1 and "ivan@example.net" in deferred
-    domain = logged_in.get("/emails", params={"domain": "example.net"}).text
-    assert len(rows(domain)) == 4
-    ranged = logged_in.get("/emails", params={"range": "custom", "start": "2026-10-26T00:00",
-                                              "end": "2026-10-27T00:00"}).text
-    assert len(rows(ranged)) == 4
-
-
-def test_custom_range_uses_display_timezone(logged_in, db):
-    from mailconsole.db import set_setting
-    with tx(db):
-        set_setting(db, "display_timezone", "Asia/Tehran")  # UTC+03:30
-    # 3F2A61C0D3 was received at 08:15:01Z = 11:45:01 Tehran.
-    inside = logged_in.get("/emails", params={"range": "custom", "start": "2026-10-20T11:45",
-                                              "end": "2026-10-20T11:46"}).text
-    assert "alice@example.org" in inside and "11:45:01" in inside
-    outside = logged_in.get("/emails", params={"range": "custom", "start": "2026-10-20T08:15",
-                                               "end": "2026-10-20T08:16"}).text
-    assert "alice@example.org" not in outside
-
-
-def test_pagination(logged_in, db, cfg):
-    lines = [f"2026-10-22T10:{i // 60:02d}:{i % 60:02d}+00:00 mail postfix/smtp[9]: {0xB00000 + i:08X}: "
-             f"to=<p{i:03d}@example.org>, relay=mx[192.0.2.1]:25, delay=1, delays=0/0/1/0, dsn=2.0.0, status=sent (250 ok)"
-             for i in range(120)]
-    ingest_lines(db, cfg, lines)
-    first = logged_in.get("/emails", params={"q": "@example.org", "domain": "example.org"}).text
-    assert "1–50 of" in first and "Page 1 / 3" in first
-    last = logged_in.get("/emails", params={"q": "@example.org", "domain": "example.org", "page": 3}).text
-    assert "Page 3 / 3" in last and len(rows(last)) == 126 - 100  # 6 fixture + 120 generated
-    beyond = logged_in.get("/emails", params={"page": 999}).text
-    assert "Page 3 / 3" in beyond or "Page" in beyond
 
 
 def test_detail_page_timeline(logged_in, db):

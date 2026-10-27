@@ -8,22 +8,25 @@
 <title>{% block title %}{% endblock %} · Mail Console</title>
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/style.css?v={{ version }}">
+<script src="/static/app.js?v={{ version }}" defer></script>
 </head>
 <body>
 {% if session %}
+{% from "_macros.html" import icon %}
 <div class="shell">
   <aside class="sidebar">
-    <a class="brand" href="/"><img src="/static/favicon.svg" alt="" width="22" height="22"><span>Mail Console</span></a>
+    <a class="brand" href="/"><img src="/static/favicon.svg" alt="" width="24" height="24"><span>Mail Console</span><span class="brand-tag">BeastPing</span></a>
     {% set path = request.url.path %}
-    <nav>
-      <a href="/" class="{{ 'active' if path == '/' }}">Overview</a>
-      <a href="/emails" class="{{ 'active' if path.startswith('/emails') or path.startswith('/queue') }}">Emails</a>
-      <a href="/monitoring" class="{{ 'active' if path.startswith('/monitoring') }}">Monitoring</a>
-      <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">Settings</a>
+    <nav aria-label="Main">
+      <a href="/emails" class="{{ 'active' if path.startswith('/emails') or path.startswith('/queue') }}"{% if path.startswith('/emails') %} aria-current="page"{% endif %}>{{ icon("mail") }}<span>Emails</span></a>
+      <a href="/" class="{{ 'active' if path == '/' }}"{% if path == '/' %} aria-current="page"{% endif %}>{{ icon("overview") }}<span>Overview</span></a>
+      <a href="/monitoring" class="{{ 'active' if path.startswith('/monitoring') }}">{{ icon("pulse") }}<span>Monitoring</span></a>
+      <div class="nav-sep" role="separator"></div>
+      <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">{{ icon("settings") }}<span>Settings</span></a>
     </nav>
     <div class="sidebar-foot">
-      <span class="muted small">{{ session.username }} · {{ display.tz_name }}</span>
-      <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="link" type="submit">Sign out</button></form>
+      <span class="who"><span class="avatar" aria-hidden="true">{{ session.username[:1]|upper }}</span><span class="small">{{ session.username }}<br><span class="muted">{{ display.tz_name }}</span></span></span>
+      <form method="post" action="/logout"><input type="hidden" name="csrf_token" value="{{ session.csrf_token }}"><button class="icon-btn ghost" type="submit" title="Sign out" aria-label="Sign out">{{ icon("logout") }}</button></form>
     </div>
   </aside>
   <main class="content">

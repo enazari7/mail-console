@@ -80,9 +80,13 @@ def _zone(name: str, default: str) -> ZoneInfo:
         raise ConfigError(f"{name}: unknown time zone {raw!r}") from exc
 
 
+# Unit names verified on the BeastPing mail server (Ubuntu 24.04). postfix.service
+# is Ubuntu's one-shot wrapper ("active (exited)"); the Postfix master process
+# runs in postfix@-.service, which is what actually reflects Postfix health.
 DEFAULT_UNITS = (
-    "Postfix=postfix@-.service,"
-    "Mailguard=mailguard.service,"
+    "Postfix=postfix.service,"
+    "Postfix-master=postfix@-.service,"
+    "Mailguard=beastping-mailguard.service,"
     "OpenDKIM=opendkim.service,"
     "Dovecot=dovecot.service"
 )
@@ -147,7 +151,7 @@ def load_config() -> Config:
         journalctl_cmd=os.environ.get("MC_JOURNALCTL", "/usr/bin/journalctl"),
         journal_units=_list(
             "MC_JOURNAL_UNITS",
-            "postfix@-.service,opendkim.service,dovecot.service,mailguard.service",
+            "postfix@-.service,opendkim.service,dovecot.service,beastping-mailguard.service",
         ),
         poll_interval=_float("MC_POLL_INTERVAL", 2.0, 0.1),
         monitor_interval=_float("MC_MONITOR_INTERVAL", 30.0, 5.0),
