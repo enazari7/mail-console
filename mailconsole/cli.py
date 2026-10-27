@@ -109,6 +109,8 @@ def cmd_admin(cfg, args) -> int:
         elif args.admin_cmd == "list":
             for row in conn.execute("SELECT username, created_ts, last_login_ts FROM admins ORDER BY id"):
                 print(row[0])
+        elif args.admin_cmd == "unlock":
+            print(f"cleared {auth.clear_failures(conn)} failed login attempt(s)")
         elif args.admin_cmd == "delete":
             from .db import tx
             with tx(conn):
@@ -223,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
         a.add_argument("--username", required=True)
         a.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
     admin_sub.add_parser("list")
+    admin_sub.add_parser("unlock", help="clear login throttling (failed attempts)")
     d = admin_sub.add_parser("delete")
     d.add_argument("--username", required=True)
     sub.add_parser("purge", help="apply retention now")

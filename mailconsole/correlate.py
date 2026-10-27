@@ -5,12 +5,12 @@ Design:
 * ``events`` is the source of truth. Every stored event carries a hash of
   its log line, so re-reading a line is a no-op (idempotent ingestion).
 * A *message* is one lifetime of a Postfix queue file. Short queue IDs are
-  reused by Postfix, so a queue ID alone does not identify a message. An
-  event joins an existing message only when the evidence allows it; see
-  :meth:`Ingestor._assign`.
-* Message and recipient state is *derived*: after each batch every touched
-  message is recomputed from its stored events. This keeps results
-  independent of ingestion order and makes duplicate input harmless.
+  reused by Postfix, so a queue ID alone does not identify a message. After
+  each batch, all events of every touched queue ID are split into lifetimes
+  by :func:`segment` using only the events themselves, so the grouping does
+  not depend on the order in which log lines were ingested.
+* Message and recipient state is *derived*: every touched message is then
+  recomputed from its events. Duplicate or late input is therefore harmless.
 """
 
 from __future__ import annotations
@@ -79,15 +79,30 @@ class Ingestor:
     def ingest(self, items: Iterable[Classified]) -> IngestStats:
         """Ingest classified records. The caller owns the transaction."""
         stats = IngestStats()
+        self._batch_counts: dict = {}
+        self._dropped: list[tuple[str, str, int]] = []
+        touched_qids: set[tuple[str, str]] = set()
         for item in items:
             stats.lines += 1
             if item.ops is not None:
                 self._store_ops(item, stats)
             elif item.event is not None:
-                self._store_event(item, stats)
-        for message_id in sorted(stats.messages_touched):
+                key = self._store_event(item, stats)
+                if key is not None:
+                    touched_qids.add(key)
+        for qid, host in sorted(touched_qids):
+            stats.messages_touched |= self._resegment(qid, host)
+        for qid, host, ts in self._dropped:
+            self.conn.execute(
+                "UPDATE messages SET events_truncated = 1 WHERE id = (SELECT id FROM messages WHERE queue_id = ?"
+                " AND host IS ? AND first_ts <= ? ORDER BY first_ts DESC LIMIT 1)", (qid, host, ts))
+        live = {r[0] for r in self.conn.execute(
+            f"SELECT id FROM messages WHERE id IN ({','.join('?' * len(stats.messages_touched))})",
+            sorted(stats.messages_touched))} if stats.messages_touched else set()
+        stats.messages_touched = live
+        for message_id in sorted(live):
             recompute_message(self.conn, message_id)
-        self._link_notifications(stats.messages_touched)
+        self._link_notifications(live)
         return stats
 
     def _link_notifications(self, message_ids: set[int]) -> None:
@@ -108,48 +123,46 @@ class Ingestor:
 
     # -- internals --------------------------------------------------------
 
-    def _store_ops(self, item: Classified, stats: IngestStats, level: str | None = None) -> None:
+    def _store_ops(self, item: Classified, stats: IngestStats) -> None:
         rec = item.record
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO ops_events(ts, host, program, pid, level, message, line_hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (rec.ts, rec.host, rec.program, rec.pid, level or item.ops.level,
-             redact(item.ops.message if item.ops else rec.message)[:4000], rec.line_hash),
+            (rec.ts, rec.host, rec.program, rec.pid, item.ops.level, redact(item.ops.message)[:4000],
+             rec.line_hash),
         )
         if cur.rowcount:
             stats.ops += 1
         else:
             stats.duplicates += 1
 
-    def _store_event(self, item: Classified, stats: IngestStats) -> None:
+    def _store_event(self, item: Classified, stats: IngestStats) -> tuple[str, str] | None:
+        """Insert an event. Queue-ID events get their message in :meth:`_resegment`."""
         rec, ev = item.record, item.event
         line_hash = rec.line_hash
         if self.conn.execute("SELECT 1 FROM events WHERE line_hash = ?", (line_hash,)).fetchone():
             stats.duplicates += 1
-            return
+            return None
 
+        message_id = None
         if ev.queue_id is None:
             message_id = self._new_message(None, rec.host, rec.ts, origin="noqueue")
-        else:
-            message_id = self._assign(ev.queue_id, rec.ts, ev.kind, rec.host, create=not item.attach_only)
-            if message_id is None:
-                # Milter/DKIM info for a queue ID we have no open message for:
-                # keep it as an operational note only when it reports a problem.
-                if ev.detail.get("level"):
-                    item.ops = None
-                    self._store_ops(item, stats, level="error")
-                return
-
-        count, truncated = self.conn.execute(
-            "SELECT event_count, events_truncated FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-        droppable = ev.kind in DROPPABLE or (ev.kind == "delivery" and ev.status == "deferred")
-        if count >= self.max_events and droppable:
-            if not truncated:
-                self.conn.execute("UPDATE messages SET events_truncated = 1 WHERE id = ?", (message_id,))
-            stats.dropped += 1
             stats.messages_touched.add(message_id)
-            return
+        else:
+            # Per-message cap on retry noise, checked against the message the
+            # event most likely belongs to (final outcomes are never dropped).
+            droppable = ev.kind in DROPPABLE or (ev.kind == "delivery" and ev.status == "deferred")
+            if droppable:
+                row = self.conn.execute(
+                    "SELECT id, event_count FROM messages WHERE queue_id = ? AND host IS ? AND first_ts <= ?"
+                    " ORDER BY first_ts DESC LIMIT 1", (ev.queue_id, rec.host, rec.ts)).fetchone()
+                key = row["id"] if row is not None else (ev.queue_id, rec.host)
+                count = (row["event_count"] if row is not None else 0) + self._batch_counts.get(key, 0)
+                if count >= self.max_events:
+                    self._dropped.append((ev.queue_id, rec.host, rec.ts))
+                    stats.dropped += 1
+                    return None
+                self._batch_counts[key] = self._batch_counts.get(key, 0) + 1
 
         self.conn.execute(
             "INSERT INTO events(message_id, ts, host, program, pid, queue_id, kind, recipient, status, dsn,"
@@ -164,9 +177,8 @@ class Ingestor:
                 line_hash,
             ),
         )
-        self.conn.execute("UPDATE messages SET event_count = event_count + 1 WHERE id = ?", (message_id,))
         stats.events += 1
-        stats.messages_touched.add(message_id)
+        return (ev.queue_id, rec.host) if ev.queue_id is not None else None
 
     def _new_message(self, queue_id: str | None, host: str, ts: int, origin: str = "unknown") -> int:
         cur = self.conn.execute(
@@ -175,65 +187,85 @@ class Ingestor:
         )
         return cur.lastrowid
 
-    def _assign(self, qid: str, ts: int, kind: str, host: str, *, create: bool) -> int | None:
-        """Find the message instance an event belongs to, or start a new one.
+    def _resegment(self, qid: str, host: str) -> set[int]:
+        """Regroup all events of one queue ID into messages; return affected message ids.
 
-        Rules (an event joins an instance only if none of these is violated):
-
-        1. The instance must have started no later than the event (with skew).
-        2. A closed instance (``removed``/``requeued`` seen) accepts no later events.
-        3. An instance has exactly one start event (smtpd ``client=`` /
-           pickup ``uid=``); a second start means the queue ID was reused.
-        4. A silence longer than the reuse gap means a different message.
-
-        Out-of-order arrivals (an older log imported later) may join the next
-        instance when that instance has no start event of its own.
+        Existing message ids are kept where a lifetime keeps most of its events,
+        so links to messages stay stable as more evidence arrives.
         """
         rows = self.conn.execute(
-            "SELECT id, first_ts, last_ts, has_start, closed_ts, host FROM messages"
-            " WHERE queue_id = ? ORDER BY first_ts DESC LIMIT 8",
-            (qid,),
-        ).fetchall()
-        rows = [r for r in rows if r["host"] in (None, host)]
-        is_start = kind in START_KINDS
+            "SELECT id, ts, kind, message_id FROM events WHERE queue_id = ? AND host IS ?",
+            (qid, host)).fetchall()
+        segments = segment([dict(r) for r in rows], self.gap_us)
+        before = {r["message_id"] for r in rows if r["message_id"] is not None}
+        used: set[int] = set()
+        for seg in segments:
+            if all(e["kind"] in ATTACH_ONLY for e in seg):
+                # Milter/DKIM notes with no Postfix lifetime around them: keep
+                # them unattached rather than inventing a message.
+                target = None
+            else:
+                votes: dict[int, int] = {}
+                for e in seg:
+                    if e["message_id"] is not None and e["message_id"] not in used:
+                        votes[e["message_id"]] = votes.get(e["message_id"], 0) + 1
+                if votes:
+                    target = max(votes, key=lambda mid: (votes[mid], -mid))
+                else:
+                    target = self._new_message(qid, host, seg[0]["ts"])
+                used.add(target)
+            changed = [e["id"] for e in seg if e["message_id"] != target]
+            for i in range(0, len(changed), 500):
+                chunk = changed[i:i + 500]
+                self.conn.execute(f"UPDATE events SET message_id = ? WHERE id IN ({','.join('?' * len(chunk))})",
+                                  [target, *chunk])
+        orphaned = before - used
+        if orphaned:
+            marks = ",".join("?" * len(orphaned))
+            self.conn.execute(f"DELETE FROM messages WHERE id IN ({marks})", sorted(orphaned))
+        return used | orphaned
 
-        target = None
-        candidate = next((r for r in rows if r["first_ts"] <= ts + SKEW_US), None)
-        if candidate is not None:
-            ok = True
-            if candidate["closed_ts"] is not None and ts > candidate["closed_ts"]:
-                ok = False
-            if is_start and (candidate["has_start"] or ts > candidate["first_ts"] + SKEW_US):
-                ok = False
-            if ts - candidate["last_ts"] > self.gap_us:
-                ok = False
-            if ok:
-                target = candidate
-        else:
-            later = min(rows, key=lambda r: r["first_ts"]) if rows else None
-            if later is not None and not later["has_start"] and later["first_ts"] - ts <= self.gap_us:
-                target = later
 
-        if target is None:
-            if not create:
-                return None
-            message_id = self._new_message(qid, host, ts)
-            target_first = target_last = ts
-        else:
-            message_id = target["id"]
-            target_first, target_last = target["first_ts"], target["last_ts"]
+ATTACH_ONLY = {"milter_info"}
+_KIND_ORDER = {"connect": 0, "pickup": 0, "removed": 9, "requeued": 9}
 
-        updates = {"first_ts": min(target_first, ts), "last_ts": max(target_last, ts)}
-        sets = "first_ts = ?, last_ts = ?"
-        params: list = [updates["first_ts"], updates["last_ts"]]
-        if is_start:
-            sets += ", has_start = 1"
-        if kind in CLOSE_KINDS:
-            sets += ", closed_ts = max(coalesce(closed_ts, 0), ?)"
-            params.append(ts)
-        params.append(message_id)
-        self.conn.execute(f"UPDATE messages SET {sets} WHERE id = ?", params)
-        return message_id
+
+def segment(events: list[dict], gap_us: int) -> list[list[dict]]:
+    """Split one queue ID's events into queue-file lifetimes.
+
+    Events are taken in time order (starts first and closes last within the
+    same timestamp, which matters for second-resolution syslog). A new
+    lifetime begins when:
+
+    1. the previous one was closed (``removed`` or ``requeued``);
+    2. a start record (smtpd ``client=``, pickup ``uid=``) arrives and the
+       current lifetime already has one, or already has events more than
+       ``SKEW_US`` older (a start is always the first record of a lifetime);
+    3. the queue ID was silent for longer than ``gap_us``.
+
+    The result depends only on the set of events, not on ingestion order.
+    """
+    ordered = sorted(events, key=lambda e: (e["ts"], _KIND_ORDER.get(e["kind"], 5), e["id"]))
+    segments: list[list[dict]] = []
+    current: list[dict] = []
+    has_start = closed = False
+    for e in ordered:
+        kind = e["kind"]
+        if current:
+            split = (
+                closed
+                or e["ts"] - current[-1]["ts"] > gap_us
+                or (kind in START_KINDS and (has_start or e["ts"] - current[0]["ts"] > SKEW_US))
+            )
+            if split:
+                segments.append(current)
+                current, has_start, closed = [], False, False
+        current.append(e)
+        has_start |= kind in START_KINDS
+        closed |= kind in CLOSE_KINDS
+    if current:
+        segments.append(current)
+    return segments
 
 
 def _detail(ev) -> dict:
@@ -334,7 +366,10 @@ def recompute_message(conn: sqlite3.Connection, message_id: int) -> None:
                     r["status"] = "expired"
                     r["final_ts"] = e["ts"]
         elif kind in ("reject", "noqueue_reject"):
-            rejected = True
+            # A reject at RCPT stage refuses one recipient; the message may still
+            # be delivered to the others. Any other stage refuses the message.
+            if not (e["recipient"] and detail.get("stage") == "RCPT"):
+                rejected = True
             if detail.get("from") is not None:
                 sender_sources.setdefault("reject", detail["from"])
             if e["recipient"]:
@@ -426,7 +461,10 @@ def _message_status(recipients: list[dict], *, nrcpt: int | None, closed: bool, 
         return "hold"
     if "deferred" in states:
         return "deferred"
-    pending = nrcpt is not None and len(states) < nrcpt and not closed and not expired
+    # nrcpt counts recipients the queue manager will deliver; RCPT-stage
+    # rejects are not among them.
+    queued_states = [s for s in states if s != "rejected"]
+    pending = nrcpt is not None and len(queued_states) < nrcpt and not closed and not expired
     accepted = states.count(ACCEPTED)
     failed = sum(1 for s in states if s in FAILED_STATES)
     if pending:
@@ -434,7 +472,9 @@ def _message_status(recipients: list[dict], *, nrcpt: int | None, closed: bool, 
     if accepted == len(states):
         return "accepted"
     if failed == len(states):
-        return "expired" if all(s == "expired" for s in states) else "bounced"
+        if all(s == "expired" for s in states):
+            return "expired"
+        return "rejected" if all(s == "rejected" for s in states) else "bounced"
     if accepted and failed:
         return "partial"
     if all(s == "removed" for s in states):

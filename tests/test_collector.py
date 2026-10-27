@@ -104,6 +104,24 @@ def test_rotation_with_immediate_compression(db, cfg, tmp_path):
     assert snapshot(db) == reference_snapshot(cfg, tmp_path)
 
 
+def test_two_rotations_while_collector_is_stopped(db, cfg, tmp_path):
+    lines = fixture_lines()
+    log = cfg.log_path
+    write(log, lines[:15], "w")
+    collector = Collector(cfg, enable_monitor=False)
+    drain(collector, db)
+    write(log, lines[15:30])                     # unread when the collector stopped
+    os.rename(log, str(log) + ".1")              # first rotation
+    write(log, lines[30:50], "w")
+    with open(str(log) + ".1", "rb") as src, gzip.open(str(log) + ".2.gz", "wb") as dst:
+        dst.write(src.read())                    # second rotation (delaycompress)
+    os.unlink(str(log) + ".1")
+    os.rename(log, str(log) + ".1")
+    write(log, lines[50:], "w")
+    drain(collector, db)
+    assert snapshot(db) == reference_snapshot(cfg, tmp_path)
+
+
 def test_copytruncate_reads_the_copy_then_the_truncated_file(db, cfg, tmp_path):
     lines = fixture_lines()
     log = cfg.log_path

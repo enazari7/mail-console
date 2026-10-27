@@ -160,6 +160,19 @@ class FileSource:
             return candidate
         return None
 
+    def _next_newer(self, rotated: Path) -> Path | None:
+        siblings = rotated_siblings(self.path)  # oldest first
+        if rotated not in siblings:
+            return None
+        index = siblings.index(rotated)
+        return siblings[index + 1] if index + 1 < len(siblings) else None
+
+    def _identity_of(self, path: Path) -> Checkpoint:
+        st = path.stat()
+        fp = _head(path, FP_LEN)
+        return Checkpoint(path=str(self.path), dev=st.st_dev, inode=st.st_ino, offset=0,
+                          fingerprint=fp, fingerprint_len=len(fp))
+
     def _same_file(self, cp: Checkpoint, st: os.stat_result) -> bool:
         if (st.st_dev, st.st_ino) != (cp.dev, cp.inode):
             return False
@@ -202,6 +215,12 @@ class FileSource:
                     return Batch([(ln, ref) for ln in lines], [], replace(cp, offset=cp.offset + consumed), notes, True)
                 if not settled:
                     return Batch([], [], cp, notes, False)
+                newer = self._next_newer(old)
+                if newer is not None:
+                    # Several rotations happened since the checkpoint (e.g. the
+                    # collector was stopped): read every generation in order.
+                    notes.append(f"finished rotated file {old.name}; continuing with {newer.name}")
+                    return Batch([], [], self._identity_of(newer), notes, True)
                 notes.append(f"finished rotated file {old.name}; following new {self.path.name}")
             elif cp.offset > 0 and st is not None and (st.st_dev, st.st_ino) == (cp.dev, cp.inode):
                 notes.append(f"log {self.path} was truncated or rewritten in place and no copy was found; "

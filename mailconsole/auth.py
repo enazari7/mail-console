@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import secrets
 import sqlite3
+import threading
 from dataclasses import dataclass
 
 from argon2 import PasswordHasher
@@ -26,10 +27,31 @@ WINDOW_US = 15 * 60 * 1_000_000
 MAX_FAILURES_PER_IP = 5
 MAX_FAILURES_PER_USER = 10
 MAX_FAILURES_GLOBAL = 50
+# Addresses with a successful login in this window are exempt from the
+# per-username and global limits, so an attacker cannot lock the owner out.
+TRUSTED_WINDOW_US = 30 * 86400 * 1_000_000
+
+# Each Argon2 operation allocates memory_cost (64 MiB). Bound concurrency so a
+# burst of login requests cannot exhaust the web service's memory limit.
+_HASH_SLOTS = threading.BoundedSemaphore(2)
+HASH_WAIT_SECONDS = 5.0
 
 
 class AuthError(ValueError):
     pass
+
+
+class AuthBusy(RuntimeError):
+    """Too many concurrent password hash operations; try again shortly."""
+
+
+def _with_hash_slot(fn, *args):
+    if not _HASH_SLOTS.acquire(timeout=HASH_WAIT_SECONDS):
+        raise AuthBusy()
+    try:
+        return fn(*args)
+    finally:
+        _HASH_SLOTS.release()
 
 
 def validate_username(username: str) -> str:
@@ -50,7 +72,7 @@ def validate_password(password: str) -> None:
 
 def hash_password(password: str) -> str:
     validate_password(password)
-    return _hasher.hash(password)
+    return _with_hash_slot(_hasher.hash, password)
 
 
 def verify_password(stored_hash: str | None, password: str) -> bool:
@@ -58,7 +80,7 @@ def verify_password(stored_hash: str | None, password: str) -> bool:
     if len(password) > MAX_PASSWORD_LENGTH:
         password = password[:MAX_PASSWORD_LENGTH]
     try:
-        return _hasher.verify(stored_hash or _DUMMY_HASH, password) and stored_hash is not None
+        return _with_hash_slot(_hasher.verify, stored_hash or _DUMMY_HASH, password) and stored_hash is not None
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
 
@@ -111,7 +133,8 @@ class Session:
 
 
 def login_allowed(conn: sqlite3.Connection, client_ip: str, username: str) -> bool:
-    since = now_us() - WINDOW_US
+    now = now_us()
+    since = now - WINDOW_US
     row = conn.execute(
         "SELECT"
         " sum(CASE WHEN client_ip = ? THEN 1 ELSE 0 END),"
@@ -121,16 +144,36 @@ def login_allowed(conn: sqlite3.Connection, client_ip: str, username: str) -> bo
         (client_ip, _username_key(username), since),
     ).fetchone()
     by_ip, by_user, overall = (v or 0 for v in row)
-    return by_ip < MAX_FAILURES_PER_IP and by_user < MAX_FAILURES_PER_USER and overall < MAX_FAILURES_GLOBAL
+    if by_ip >= MAX_FAILURES_PER_IP:
+        return False
+    trusted = conn.execute("SELECT 1 FROM login_attempts WHERE client_ip = ? AND success = 1 AND ts >= ? LIMIT 1",
+                           (client_ip, now - TRUSTED_WINDOW_US)).fetchone()
+    return bool(trusted) or (by_user < MAX_FAILURES_PER_USER and overall < MAX_FAILURES_GLOBAL)
+
+
+def begin_attempt(conn: sqlite3.Connection, client_ip: str, username: str) -> int:
+    """Record an attempt as failed *before* hashing, so parallel bursts count."""
+    with tx(conn):
+        return conn.execute("INSERT INTO login_attempts(ts, client_ip, username_hash, success) VALUES (?, ?, ?, 0)",
+                            (now_us(), client_ip, _username_key(username))).lastrowid
+
+
+def finish_attempt(conn: sqlite3.Connection, attempt_id: int, client_ip: str, success: bool) -> None:
+    if not success:
+        return
+    with tx(conn):
+        conn.execute("UPDATE login_attempts SET success = 1 WHERE id = ?", (attempt_id,))
+        # A successful login clears this address's failure history.
+        conn.execute("DELETE FROM login_attempts WHERE client_ip = ? AND success = 0", (client_ip,))
 
 
 def record_attempt(conn: sqlite3.Connection, client_ip: str, username: str, success: bool) -> None:
+    finish_attempt(conn, begin_attempt(conn, client_ip, username), client_ip, success)
+
+
+def clear_failures(conn: sqlite3.Connection) -> int:
     with tx(conn):
-        conn.execute("INSERT INTO login_attempts(ts, client_ip, username_hash, success) VALUES (?, ?, ?, ?)",
-                     (now_us(), client_ip, _username_key(username), int(success)))
-        if success:
-            # A successful login clears this address's failure history.
-            conn.execute("DELETE FROM login_attempts WHERE client_ip = ? AND success = 0", (client_ip,))
+        return conn.execute("DELETE FROM login_attempts WHERE success = 0").rowcount
 
 
 def authenticate(conn: sqlite3.Connection, username: str, password: str) -> int | None:

@@ -286,3 +286,45 @@ def test_range_resolution():
     assert r.key == "24h"
     r = resolve_range("7d", "", "", tz, now)
     assert r.end - r.start == 7 * 86400 * 10**6
+
+
+def test_hash_concurrency_limit_returns_busy(client, admin, monkeypatch):
+    monkeypatch.setattr(auth, "HASH_WAIT_SECONDS", 0.05)
+    held = [auth._HASH_SLOTS.acquire(), auth._HASH_SLOTS.acquire()]
+    try:
+        r = login(client)
+        assert r.status_code == 429 and "busy" in r.text
+    finally:
+        for _ in held:
+            auth._HASH_SLOTS.release()
+    assert login(client).status_code == 303
+
+
+def test_username_lockout_does_not_block_known_address(cfg, app_db, admin, db):
+    from mailconsole import cli
+    # A previously successful address...
+    auth.record_attempt(db, "198.51.100.7", "admin", True)
+    # ...is not locked out by failures for the same username from elsewhere.
+    for i in range(auth.MAX_FAILURES_PER_USER):
+        auth.record_attempt(db, f"203.0.113.{i}", "admin", False)
+    assert auth.login_allowed(db, "198.51.100.7", "admin")
+    assert not auth.login_allowed(db, "203.0.113.99", "admin")
+    assert auth.clear_failures(db) == auth.MAX_FAILURES_PER_USER
+    assert auth.login_allowed(db, "203.0.113.99", "admin")
+    assert cli.build_parser().parse_args(["admin", "unlock"]).admin_cmd == "unlock"
+
+
+def test_failed_attempt_is_recorded_before_hashing(client, admin, db, monkeypatch):
+    seen = []
+    real = auth.authenticate
+    def spy(conn, username, password):
+        seen.append(conn.execute("SELECT count(*) FROM login_attempts WHERE success = 0").fetchone()[0])
+        return real(conn, username, password)
+    monkeypatch.setattr(auth, "authenticate", spy)
+    login(client, password="wrong password!!")
+    assert seen == [1]
+
+
+def test_huge_custom_range_is_bounded(logged_in):
+    r = logged_in.get("/", params={"range": "custom", "start": "0001-01-01T00:00", "end": "9999-12-31T00:00"})
+    assert r.status_code == 200 and r.text.count('class="bar"') <= 60

@@ -179,10 +179,13 @@ def apply_retention(conn: sqlite3.Connection, cfg: Config, *, now: int | None = 
     result = {"retention_days": days, "messages": _delete_messages_before(conn, cutoff)}
     with tx(conn):
         result["ops_events"] = conn.execute("DELETE FROM ops_events WHERE ts < ?", (cutoff,)).rowcount
+        # Milter/DKIM notes that never matched a Postfix message lifetime.
+        conn.execute("DELETE FROM events WHERE message_id IS NULL AND ts < ?", (cutoff,))
         snap_cutoff = now - min(days, QUEUE_SNAPSHOT_RETENTION_DAYS) * 86400 * 1_000_000
         conn.execute("DELETE FROM queue_snapshots WHERE ts < ?", (snap_cutoff,))
         conn.execute("DELETE FROM sessions WHERE expires_ts < ?", (now,))
-        conn.execute("DELETE FROM login_attempts WHERE ts < ?", (now - 7 * 86400 * 1_000_000,))
+        conn.execute("DELETE FROM login_attempts WHERE success = 0 AND ts < ?", (now - 7 * 86400 * 1_000_000,))
+        conn.execute("DELETE FROM login_attempts WHERE ts < ?", (now - 31 * 86400 * 1_000_000,))
 
     cap = cfg.max_db_mb * 1024 * 1024
     trimmed = 0
@@ -273,6 +276,12 @@ class Collector:
                         next_maintenance = now + MAINTENANCE_SECONDS
                 except sqlite3.OperationalError as exc:
                     log.error("database error: %s", exc)
+                    more = False
+                    self.stop.wait(5.0)
+                except (OSError, EOFError) as exc:
+                    # E.g. a rotated file deleted or still being compressed by
+                    # logrotate. The checkpoint is unchanged; retry shortly.
+                    log.warning("log read error, retrying: %s", exc)
                     more = False
                     self.stop.wait(5.0)
                 if not more:

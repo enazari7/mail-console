@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ipaddress
+from html import escape as html_escape
 import secrets
 import sqlite3
 from datetime import datetime
@@ -260,7 +261,7 @@ def create_app(cfg: Config) -> FastAPI:
     async def _http_error(request: Request, exc: StarletteHTTPException):
         return HTMLResponse(f"<!doctype html><title>{exc.status_code}</title>"
                             f'<link rel="stylesheet" href="/static/style.css">'
-                            f'<main class="center"><h1>{exc.status_code}</h1><p>{exc.detail}</p>'
+                            f'<main class="center"><h1>{exc.status_code}</h1><p>{html_escape(str(exc.detail))}</p>'
                             f'<p><a href="/">Back to overview</a></p></main>', status_code=exc.status_code)
 
     def session_dep(request: Request, conn: sqlite3.Connection = Depends(get_db)) -> auth.Session:
@@ -322,8 +323,12 @@ def create_app(cfg: Config) -> FastAPI:
         ip = _client_ip(request, cfg)
         if not auth.login_allowed(conn, ip, username):
             return fail("Too many failed attempts. Wait 15 minutes and try again.", 429)
-        admin_id = auth.authenticate(conn, username, password)
-        auth.record_attempt(conn, ip, username, admin_id is not None)
+        attempt = auth.begin_attempt(conn, ip, username)
+        try:
+            admin_id = auth.authenticate(conn, username, password)
+        except auth.AuthBusy:
+            return fail("The server is busy. Try again in a few seconds.", 429)
+        auth.finish_attempt(conn, attempt, ip, admin_id is not None)
         if admin_id is None:
             return fail("Invalid username or password.", 401)
         token = auth.create_session(conn, admin_id, idle_minutes=cfg.session_idle_minutes,
@@ -435,15 +440,19 @@ def create_app(cfg: Config) -> FastAPI:
         ip = _client_ip(request, cfg)
         if not auth.login_allowed(conn, ip, session.username):
             return settings_error(request, conn, session, "Too many failed attempts. Try again later.", 429)
-        if auth.authenticate(conn, session.username, current_password) is None:
-            auth.record_attempt(conn, ip, session.username, False)
-            return settings_error(request, conn, session, "Current password is incorrect.", 403)
-        if new_password != confirm_password:
-            return settings_error(request, conn, session, "The new passwords do not match.")
-        if new_password == current_password:
-            return settings_error(request, conn, session, "Choose a password different from the current one.")
+        attempt = auth.begin_attempt(conn, ip, session.username)
         try:
+            ok = auth.authenticate(conn, session.username, current_password) is not None
+            auth.finish_attempt(conn, attempt, ip, ok)
+            if not ok:
+                return settings_error(request, conn, session, "Current password is incorrect.", 403)
+            if new_password != confirm_password:
+                return settings_error(request, conn, session, "The new passwords do not match.")
+            if new_password == current_password:
+                return settings_error(request, conn, session, "Choose a password different from the current one.")
             auth.set_password(conn, session.admin_id, new_password, keep_session=session.token_hash)
+        except auth.AuthBusy:
+            return settings_error(request, conn, session, "The server is busy. Try again in a few seconds.", 429)
         except auth.AuthError as exc:
             return settings_error(request, conn, session, str(exc).capitalize() + ".")
         return RedirectResponse("/settings?saved=password", status_code=303)

@@ -89,7 +89,7 @@ The web interface listens on `127.0.0.1:8710` only.
 **SSH tunnel (recommended):**
 
 ```bash
-ssh -N -L 8710:127.0.0.1:8710 <admin-user>@mail.beastping.com
+ssh -N -L 8710:127.0.0.1:8710 <admin-user>@<mail-server>
 ```
 
 Then open <http://localhost:8710>. Browsers treat `localhost` as a secure
@@ -155,6 +155,7 @@ console never affects Postfix.
 | Service logs | `journalctl -u mail-console-collector -u mail-console-web` |
 | Collector status | Monitoring page → Collector, or `sudo mail-console check` |
 | Reset a password | `sudo mail-console admin reset-password --username admin` (signs out all sessions) |
+| Locked out by throttling | `sudo mail-console admin unlock` |
 | Apply retention now | `sudo mail-console purge` |
 | Database backup | `sudo -u mailconsole sqlite3 /var/lib/mail-console/mail-console.sqlite3 ".backup /var/lib/mail-console/backups/manual.sqlite3"` (or copy while the services are stopped) |
 | Re-ingest from scratch | stop both services, move the database away, `sudo mail-console migrate`, `sudo mail-console import --rotated`, recreate the admin, start |

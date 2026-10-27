@@ -199,6 +199,22 @@ def _float_or_none(value: str | None) -> float | None:
         return None
 
 
+LOCAL_RELAY_RE = re.compile(r"\[(?:127\.\d+\.\d+\.\d+|::1|ipv6:::1)\]|^(?:localhost|127\.\d+\.\d+\.\d+)\b")
+QUEUED_AS_RE = re.compile(r"\bqueued as ([0-9A-Za-z]{6,20})\b")
+
+
+def _delivery_detail(kv: dict, response: str | None) -> dict:
+    detail = {k: v for k, v in kv.items() if k in ("conn_use",)}
+    relay = kv.get("relay") or ""
+    if response and LOCAL_RELAY_RE.search(relay):
+        # Hand-off to a local after-queue filter or second Postfix instance:
+        # the message continues under another queue ID.
+        m = QUEUED_AS_RE.search(response)
+        if m:
+            detail["queued_as"] = m.group(1)
+    return detail
+
+
 def _parse_reject(qid: str | None, daemon: str, action: str, body: str) -> PostfixEvent:
     env = ENVELOPE_RE.search(body)
     sender = recipient = None
@@ -274,7 +290,7 @@ def parse_postfix_message(daemon: str, message: str) -> PostfixEvent | OpsEvent 
                 delay=_float_or_none(kv.get("delay")),
                 delays=kv.get("delays") or None,
                 response=(dm.group("resp") or "")[:2000] or None,
-                detail={k: v for k, v in kv.items() if k in ("conn_use",)},
+                detail=_delivery_detail(kv, dm.group("resp")),
             )
     if rest.startswith("client="):
         kv = dict(KV_RE.findall(rest))

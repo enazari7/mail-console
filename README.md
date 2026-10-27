@@ -75,12 +75,14 @@ systemctl show / postqueue -j ◀─┘  every 30 s (read-only)
 3. **Store** – every event keeps a hash of its log line, so re-reading the same
    line (restart, overlap between import and live tailing) is a no-op.
 4. **Correlate** – a *message* is one lifetime of a Postfix queue file. Because
-   short Queue IDs are reused, an event joins an existing message only if that
-   message started no later than the event, is not closed (`removed`/`requeued`),
-   does not already have a start record when the event is a new start
-   (`client=`/`pickup`), and has not been silent longer than
-   `MC_QUEUE_REUSE_GAP_HOURS`. Postfix-generated bounce notices and
-   `postsuper -r` requeues are linked to their original message.
+   short Queue IDs are reused, all stored events of each touched Queue ID are
+   re-split into lifetimes after every batch, in time order: a new lifetime
+   starts after a `removed`/`requeued` record, at a second start record
+   (`client=`/`pickup`), or after silence longer than `MC_QUEUE_REUSE_GAP_HOURS`.
+   Message ids stay stable as evidence is added. Postfix-generated bounce
+   notices, `postsuper -r` requeues and hand-offs to a local relay
+   (`queued as …`) are linked to their original message. A reject at RCPT
+   stage affects only that recipient.
 5. **Derive** – message and per-recipient state is recomputed from the stored
    events after each batch, so the result does not depend on ingestion order
    (tested by ingesting the fixture forward, reversed and shuffled).
@@ -109,7 +111,7 @@ sudo mail-console admin create --username admin
 sudo systemctl start mail-console-collector mail-console-web
 ```
 
-Then open it through an SSH tunnel: `ssh -N -L 8710:127.0.0.1:8710 <admin>@mail.beastping.com`
+Then open it through an SSH tunnel: `ssh -N -L 8710:127.0.0.1:8710 <admin>@<mail-server>`
 and browse to <http://localhost:8710>.
 
 ## Command line
@@ -122,6 +124,7 @@ All commands run as the service user through the `/usr/local/sbin/mail-console` 
 | `mail-console parse-check FILE` | Dry run: what the parser recognises in a log file (writes nothing) |
 | `mail-console import --rotated [--include-current] [FILE...]` | Historical import, oldest first, idempotent; refuses while the collector runs |
 | `mail-console admin create\|reset-password\|list\|delete` | Administrator accounts (`--password-stdin` for automation) |
+| `mail-console admin unlock` | Clear login throttling after repeated failed attempts |
 | `mail-console migrate` | Apply database migrations |
 | `mail-console purge` | Apply retention now |
 | `mail-console serve` / `collect` | What the systemd units run |
@@ -165,6 +168,10 @@ uninstall cycle on an Ubuntu 24.04 ARM64 runner without Docker.
   handled by the existing BeastPing bounce processor; this console does not read
   its ledger yet, so such messages remain *Accepted* here. A read-only
   integration needs a separate review.
+* A hand-off to a local after-queue content filter is shown as accepted for the
+  first queue file and linked to the queue file it continues as; both count in
+  the overview totals. (Mailguard is a milter, so the current setup has no such
+  hand-off.)
 * **Subjects** appear only if Postfix logs them (requires a `header_checks`
   change that is out of scope).
 * **Single role.** Every account is a full administrator; there is no 2FA.

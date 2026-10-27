@@ -89,8 +89,10 @@ def resolve_range(key: str | None, start: str | None, end: str | None, tz: ZoneI
     if key == "custom":
         s, e = parse_local(start, tz), parse_local(end, tz)
         if s is not None and e is not None and e > s:
+            s = max(s, e - 400 * DAY)  # bound the work and the number of chart buckets
             span = e - s
-            bucket = 5 * 60 * US if span <= 2 * HOUR else HOUR if span <= 3 * DAY else 6 * HOUR if span <= 10 * DAY else DAY
+            bucket = (5 * 60 * US if span <= 2 * HOUR else HOUR if span <= 3 * DAY else 6 * HOUR if span <= 10 * DAY
+                      else DAY if span <= 120 * DAY else 7 * DAY)
             return TimeRange("custom", s, e, bucket, "Custom range")
         key = default
     if key not in RANGE_PRESETS and not (key == "all" and allow_all):
@@ -271,6 +273,16 @@ def message_detail(conn: sqlite3.Connection, message_id: int) -> dict | None:
         if parent:
             related.append({"relation": "Notice about original message", "queue_id": parent["queue_id"],
                             "id": parent["id"], "status": parent["status"]})
+    for e in events:
+        handoff = e["detail"].get("queued_as")
+        if handoff and e["status"] == "sent":
+            nxt = conn.execute(
+                "SELECT id, status FROM messages WHERE queue_id = ? AND first_ts BETWEEN ? AND ?"
+                " ORDER BY abs(first_ts - ?) LIMIT 1",
+                (handoff, e["ts"] - 60 * US, e["ts"] + 60 * US, e["ts"])).fetchone()
+            related.append({"relation": f"Handed to local relay {e['relay']}; continues as",
+                            "queue_id": handoff, "id": nxt["id"] if nxt else None,
+                            "status": nxt["status"] if nxt else None})
     if msg["orig_queue_id"]:
         prev = conn.execute(
             "SELECT id, status FROM messages WHERE queue_id = ? AND first_ts <= ? ORDER BY first_ts DESC LIMIT 1",

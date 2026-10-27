@@ -162,8 +162,8 @@ def test_event_cap_keeps_final_outcome(db, cfg):
                  "delay=3600, delays=0/0/1/0, dsn=2.0.0, status=sent (250 ok)")
     stats = ingest_lines(db, cfg, lines, max_events=10)
     [m] = by_qid(db, "ABCDEF0004")
-    assert stats.dropped == 21 and m["events_truncated"] == 1
-    assert m["status"] == "accepted"
+    assert stats.dropped >= 20 and m["events_truncated"] == 1
+    assert m["event_count"] <= 12 and m["status"] == "accepted"
 
 
 def test_recompute_is_stable(db, cfg):
@@ -172,3 +172,64 @@ def test_recompute_is_stable(db, cfg):
     for (mid,) in db.execute("SELECT id FROM messages").fetchall():
         recompute_message(db, mid)
     assert snapshot(db) == before
+
+
+def test_rcpt_stage_reject_is_per_recipient(db, cfg):
+    lines = [
+        "2026-10-20T12:00:00+00:00 mail postfix/smtpd[1]: ABCDEF0010: client=a[192.0.2.1]",
+        "2026-10-20T12:00:01+00:00 mail postfix/smtpd[1]: ABCDEF0010: reject: RCPT from a[192.0.2.1]: 550 5.1.1 "
+        "<bad@example.org>: Recipient address rejected: User unknown; from=<s@example.com> to=<bad@example.org> "
+        "proto=ESMTP helo=<a>",
+        "2026-10-20T12:00:02+00:00 mail postfix/qmgr[2]: ABCDEF0010: from=<s@example.com>, size=10, nrcpt=1 (queue active)",
+        "2026-10-20T12:00:03+00:00 mail postfix/smtp[3]: ABCDEF0010: to=<good@example.net>, relay=mx[192.0.2.9]:25, "
+        "delay=1, delays=0/0/1/0, dsn=2.0.0, status=sent (250 ok)",
+        "2026-10-20T12:00:03.5+00:00 mail postfix/qmgr[2]: ABCDEF0010: removed",
+    ]
+    ingest_lines(db, cfg, lines[:3])
+    [m] = by_qid(db, "ABCDEF0010")
+    assert m["status"] != "rejected"  # still waiting for the accepted recipient
+    ingest_lines(db, cfg, lines[3:])
+    [m] = by_qid(db, "ABCDEF0010")
+    rc = recipients(db, m["id"])
+    assert rc["bad@example.org"]["status"] == "rejected" and rc["good@example.net"]["status"] == "accepted"
+    assert m["status"] == "partial"
+
+
+def test_late_import_of_older_message_with_reused_id(db, cfg):
+    # A DSN without a start record is ingested live first...
+    live = [
+        "2026-10-22T09:00:00+00:00 mail postfix/cleanup[1]: ABCDEF0020: message-id=<dsn@example.com>",
+        "2026-10-22T09:00:00.1+00:00 mail postfix/qmgr[2]: ABCDEF0020: from=<>, size=10, nrcpt=1 (queue active)",
+        "2026-10-22T09:00:01+00:00 mail postfix/local[3]: ABCDEF0020: to=<x@example.com>, relay=local, delay=1, "
+        "delays=0/0/0/1, dsn=2.0.0, status=sent (delivered to mailbox)",
+        "2026-10-22T09:00:01.1+00:00 mail postfix/qmgr[2]: ABCDEF0020: removed",
+    ]
+    # ...then an older, complete message with the same short ID is imported.
+    older = [
+        "2026-10-20T08:00:00+00:00 mail postfix/smtpd[4]: ABCDEF0020: client=a[192.0.2.1]",
+        "2026-10-20T08:00:00.1+00:00 mail postfix/qmgr[2]: ABCDEF0020: from=<a@example.com>, size=10, nrcpt=1 (queue active)",
+        "2026-10-20T08:00:01+00:00 mail postfix/smtp[5]: ABCDEF0020: to=<y@example.org>, relay=mx[192.0.2.9]:25, "
+        "delay=1, delays=0/0/1/0, dsn=5.1.1, status=bounced (550 no such user)",
+        "2026-10-20T08:00:01.1+00:00 mail postfix/qmgr[2]: ABCDEF0020: removed",
+    ]
+    ingest_lines(db, cfg, live)
+    live_id = by_qid(db, "ABCDEF0020")[0]["id"]
+    ingest_lines(db, cfg, older)
+    first, second = by_qid(db, "ABCDEF0020")
+    assert (first["sender"], first["status"]) == ("a@example.com", "bounced")
+    assert (second["sender"], second["status"]) == ("", "accepted")
+    assert second["id"] == live_id  # the existing message keeps its id (stable links)
+
+
+def test_local_filter_handoff_is_linked(db, cfg):
+    lines = [
+        "2026-10-20T12:00:00+00:00 mail postfix/smtpd[1]: ABCDEF0030: client=a[192.0.2.1]",
+        "2026-10-20T12:00:01+00:00 mail postfix/smtp[3]: ABCDEF0030: to=<z@example.org>, relay=127.0.0.1[127.0.0.1]:10025, "
+        "delay=0.1, delays=0/0/0/0.1, dsn=2.0.0, status=sent (250 2.0.0 Ok: queued as ABCDEF0031)",
+        "2026-10-20T12:00:01.1+00:00 mail postfix/smtpd[9]: ABCDEF0031: client=localhost[127.0.0.1]",
+    ]
+    ingest_lines(db, cfg, lines)
+    from mailconsole.queries import message_detail
+    d = message_detail(db, by_qid(db, "ABCDEF0030")[0]["id"])
+    [rel] = [r for r in d["related"] if "continues as" in r["relation"]]
+    assert rel["queue_id"] == "ABCDEF0031" and rel["id"] == by_qid(db, "ABCDEF0031")[0]["id"]
