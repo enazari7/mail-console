@@ -69,12 +69,39 @@ else
   chmod 0640 "$ETC_DIR/mail-console.env"
 fi
 
+# --- message capture: user, spool, archive, key ------------------------------
+# Only prepares the console side. Postfix is NOT changed here; activating
+# capture is a separate, reviewed step (docs/MAIL-CAPTURE.md).
+CAPTURE_USER=mcarchive
+SPOOL_ROOT=/var/spool/mail-console
+if ! id -u "$CAPTURE_USER" >/dev/null 2>&1; then
+  log "creating system user $CAPTURE_USER (runs only the Postfix capture program)"
+  useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin \
+    --comment "Mail Console message capture" "$CAPTURE_USER"
+fi
+install -d -m 0755 -o root -g root "$SPOOL_ROOT"
+# setgid directory: captured files belong to group mailconsole (0640), so the
+# collector can read and remove them; the capture user cannot read anything else.
+install -d -m 2770 -o "$CAPTURE_USER" -g "$SERVICE_USER" "$SPOOL_ROOT/incoming"
+install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_USER" "$SPOOL_ROOT/quarantine" "$DATA_DIR/archive"
+if [ ! -f "$ETC_DIR/archive.key" ]; then
+  log "generating archive encryption key $ETC_DIR/archive.key -- back it up separately from the archive"
+  ( umask 077; "$PYTHON" -c 'import secrets; print(secrets.token_hex(32))' > "$ETC_DIR/archive.key" )
+fi
+chown root:"$SERVICE_USER" "$ETC_DIR/archive.key"
+chmod 0640 "$ETC_DIR/archive.key"
+
 # --- release -----------------------------------------------------------------
 log "installing release $RELEASE"
 install -d -m 0755 "$DEST"
 cp -r "$SRC/mailconsole" "$DEST/"
 cp "$SRC/requirements.lock" "$SRC/pyproject.toml" "$SRC/README.md" "$DEST/"
 cp -r "$SRC/deploy" "$DEST/"
+install -d -m 0755 "$DEST/bin"
+install -m 0755 "$SRC/deploy/bin/mc-capture" "$DEST/bin/mc-capture"
+# Stable path for Postfix (survives release switches, rollbacks and a normal uninstall).
+install -d -m 0755 /usr/local/libexec/mail-console
+install -m 0755 "$SRC/deploy/bin/mc-capture" /usr/local/libexec/mail-console/mc-capture
 find "$DEST" -name '__pycache__' -prune -exec rm -rf {} +
 "$PYTHON" -m venv "$DEST/venv"
 "$DEST/venv/bin/python" -m pip install --quiet --disable-pip-version-check --no-cache-dir \

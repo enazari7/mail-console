@@ -1,0 +1,3 @@
+# /etc/postfix/mailconsole_transport -- run "postmap /etc/postfix/mailconsole_transport" after changes.
+# The .invalid top-level domain can never resolve, so this address cannot leave the server.
+archive@mail-console.invalid    mailconsole-archive:

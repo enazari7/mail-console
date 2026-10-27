@@ -23,6 +23,7 @@
       <a href="/monitoring" class="{{ 'active' if path.startswith('/monitoring') }}">{{ icon("pulse") }}<span>Monitoring</span></a>
       <div class="nav-sep" role="separator"></div>
       <a href="/settings" class="{{ 'active' if path.startswith('/settings') }}">{{ icon("settings") }}<span>Settings</span></a>
+      <a href="/audit" class="{{ 'active' if path.startswith('/audit') }}">{{ icon("lock") }}<span>Audit log</span></a>
     </nav>
     <div class="sidebar-foot">
       <span class="who"><span class="avatar" aria-hidden="true">{{ session.username[:1]|upper }}</span><span class="small">{{ session.username }}<br><span class="muted">{{ display.tz_name }}</span></span></span>

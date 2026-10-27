@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Two-factor authentication{% endblock %}
+{% block public %}
+<main class="center">
+  <div class="card login">
+    <div class="brand big"><img src="/static/favicon.svg" alt="" width="28" height="28"><span>Mail Console</span></div>
+    <h1>Authentication code</h1>
+    <p class="muted">Enter the 6-digit code from your authenticator app.</p>
+    {% if error %}<div class="banner error" role="alert">{{ error }}</div>{% endif %}
+    <form method="post" action="/login/totp" class="stack">
+      <input type="hidden" name="csrf_token" value="{{ csrf }}">
+      <input type="hidden" name="next" value="{{ next }}">
+      <label>Code<input name="code" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9 ]{6,7}" maxlength="7" required autofocus></label>
+      <button class="btn primary" type="submit">Verify</button>
+      <a class="small" href="/login">Start over</a>
+    </form>
+  </div>
+</main>
+{% endblock %}

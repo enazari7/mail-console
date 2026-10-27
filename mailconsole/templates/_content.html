@@ -1,0 +1,82 @@
+{# Archived message content. Expects: content (archive.load_view), envelope_sender, envelope_rcpts (list or none). #}
+{% from "_macros.html" import addr, icon %}
+{% set a = content.archive %}
+{% if content.error and not a %}
+  <div class="banner error">{{ content.error }}</div>
+{% else %}
+  <div class="content-meta muted small">
+    Captured {{ display.ts(a.captured_ts) }} · {{ a.size|human_bytes }}{% if a.encrypted %} · encrypted at rest{% endif %}
+    · linked by {{ {"archive-delivery": "the logged delivery of this archive copy (same Postfix queue file)", "queue-lifetime": "Postfix queue ID and capture time", "pending": "— not linked yet", "conflict": "— not linked (conflict)"}.get(a.link_method, a.link_method) }}
+    {% if a.link_note %}<br><span class="bad-text">{{ a.link_note }}</span>{% endif %}
+  </div>
+  {% if content.error %}<div class="banner error">{{ content.error }}</div>{% endif %}
+
+  <div class="addr-blocks">
+    <div class="addr-block">
+      <h3>Message headers <span class="muted small">(as written by the sender)</span></h3>
+      <dl class="meta compact">
+        <dt>Subject</dt><dd dir="auto">{{ a.subject or "—" }}</dd>
+        <dt>From</dt><dd dir="auto">{{ a.from_header or "—" }}</dd>
+        <dt>To</dt><dd dir="auto">{{ a.to_header or "—" }}</dd>
+        {% if a.cc_header %}<dt>Cc</dt><dd dir="auto">{{ a.cc_header }}</dd>{% endif %}
+        {% if a.reply_to_header %}<dt>Reply-To</dt><dd dir="auto">{{ a.reply_to_header }}</dd>{% endif %}
+        <dt>Date</dt><dd>{{ a.date_header or "—" }}</dd>
+        <dt>Message-ID</dt><dd class="mono wrap">{% if a.header_message_id %}&lt;{{ a.header_message_id }}&gt;{% else %}<span class="unknown">none in headers</span>{% endif %}</dd>
+      </dl>
+    </div>
+    <div class="addr-block">
+      <h3>SMTP envelope <span class="muted small">(who Postfix actually delivered to)</span></h3>
+      <dl class="meta compact">
+        <dt>MAIL FROM</dt><dd>{{ addr(envelope_sender if envelope_sender is not none else a.envelope_sender) }}</dd>
+        <dt>RCPT TO</dt><dd>{% if envelope_rcpts %}{% for r in envelope_rcpts %}{{ r }}{% if not loop.last %}, {% endif %}{% endfor %}{% else %}<span class="unknown">not in the delivery logs</span>{% endif %}</dd>
+        {% if a.sasl_username %}<dt>SASL user</dt><dd>{{ a.sasl_username }}</dd>{% endif %}
+      </dl>
+      <p class="muted small">Envelope recipients include Bcc recipients, which never appear in the headers. The archive copy itself is not listed.</p>
+    </div>
+  </div>
+
+  <div class="ctabs">
+    <input type="radio" name="ctab" id="ct-html" {% if content.has_html %}checked{% endif %}>
+    <input type="radio" name="ctab" id="ct-text" {% if not content.has_html %}checked{% endif %}>
+    <input type="radio" name="ctab" id="ct-head">
+    <input type="radio" name="ctab" id="ct-att">
+    <div class="ctab-labels" role="tablist">
+      <label for="ct-html">HTML</label>
+      <label for="ct-text">Plain text</label>
+      <label for="ct-head">Headers</label>
+      <label for="ct-att">Attachments <span class="count">{{ content.attachments|length }}</span></label>
+      <a class="btn small" href="/archives/{{ a.id }}/raw.eml" download>{{ icon("download") }}Download .eml</a>
+    </div>
+    <div class="ctab-panels">
+      <div class="ctab-panel p-html">
+        {% if content.has_html %}
+        <p class="muted small">Shown in an isolated sandbox: scripts, forms, remote images and other network requests are blocked; embedded (cid:) images are shown. Links do not open.</p>
+        <iframe class="html-preview" src="/archives/{{ a.id }}/preview.html" sandbox="" referrerpolicy="no-referrer" loading="lazy" title="HTML body (sandboxed)"></iframe>
+        {% else %}<p class="muted">This message has no HTML part.</p>{% endif %}
+      </div>
+      <div class="ctab-panel p-text">
+        {% if content.text is not none %}
+        <pre class="code body-text" dir="auto">{{ content.text }}</pre>
+        {% if content.text_truncated %}<p class="muted small">Showing the first 2 MiB; download the .eml for the complete text.</p>{% endif %}
+        {% else %}<p class="muted">This message has no plain-text part.</p>{% endif %}
+      </div>
+      <div class="ctab-panel p-head">
+        <pre class="code headers-raw">{{ content.headers }}</pre>
+      </div>
+      <div class="ctab-panel p-att">
+        {% if content.attachments or content.inline %}
+        <table class="data compact">
+          <thead><tr><th>Name</th><th>Type</th><th class="num">Size</th><th></th></tr></thead>
+          <tbody>
+          {% for p in content.attachments + content.inline %}
+            <tr><td dir="auto" class="wrap">{{ p.filename or ("inline image " ~ p.content_id if p.content_id else "unnamed part " ~ p.index) }}{% if p in content.inline %} <span class="chip">inline</span>{% endif %}</td>
+              <td class="mono small">{{ p.content_type }}</td><td class="num">{{ p.size|human_bytes if p.size is not none else "—" }}</td>
+              <td><a class="btn small" href="/archives/{{ a.id }}/parts/{{ p.index }}">{{ icon("download") }}Download</a></td></tr>
+          {% endfor %}
+          </tbody>
+        </table>
+        {% else %}<p class="muted">No attachments.</p>{% endif %}
+      </div>
+    </div>
+  </div>
+{% endif %}

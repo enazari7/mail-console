@@ -54,6 +54,34 @@
   </section>
 </div>
 
+{% set ar = m.archive %}
+<section class="card">
+  <div class="card-head"><h2>Message archive</h2>
+    <span class="badge st-{{ {'ok': 'accepted', 'warning': 'deferred', 'critical': 'bounced'}[ar.level] }}">{{ {'ok': 'Healthy', 'warning': 'Attention', 'critical': 'Action needed'}[ar.level] }}</span></div>
+  {% if not ar.enabled %}<p class="muted">Message capture is disabled (MC_ARCHIVE_ENABLED=false).</p>
+  {% elif not ar.spool_exists and not ar.archives %}<p class="muted">Not set up yet: the capture spool does not exist. See docs/MAIL-CAPTURE.md.</p>
+  {% else %}
+  {% if ar.blocked and ar.blocked[0] %}<div class="banner error">{{ ar.blocked[0] }}</div>{% endif %}
+  {% if ar.key_missing %}<div class="banner error">The archive encryption key is missing; captures wait in the spool and are not stored.</div>{% endif %}
+  {% if ar.skipped_7d %}<div class="banner error">{{ ar.skipped_7d }} cop{{ "y was" if ar.skipped_7d == 1 else "ies were" }} not archived in the last 7 days because of storage pressure (see Recent operational errors). Mail delivery was not affected.</div>{% endif %}
+  {% if ar.missing_7d %}<div class="banner error">{{ ar.missing_7d }} message{{ "" if ar.missing_7d == 1 else "s" }} in the last 7 days had an archive copy delivered by Postfix but no stored copy or skip record (disk was likely full).</div>{% endif %}
+  {% if ar.deferred_copies %}<div class="banner error">{{ ar.deferred_copies }} archive cop{{ "y is" if ar.deferred_copies == 1 else "ies are" }} deferred by Postfix (real recipients are unaffected). See Recent operational errors.</div>{% endif %}
+  <dl class="meta">
+    <dt>Archived messages</dt><dd>{{ "{:,}".format(ar.archives) }}{% if ar.last_capture_ts %} · last capture {{ ago(ar.last_capture_ts) }}{% endif %}</dd>
+    <dt>Storage</dt><dd>{{ ar.used|human_bytes }} of {{ ar.limit|human_bytes }} ({{ "%.1f"|format(ar.percent) }}%){% if ar.free is not none %} · {{ ar.free|human_bytes }} free on disk{% endif %}</dd>
+    <dt>Spool backlog</dt><dd>{{ ar.backlog }}{% if ar.oldest_backlog_ts %} · oldest {{ ago(ar.oldest_backlog_ts) }}{% endif %}</dd>
+    <dt>Retention</dt><dd>{{ ar.retention_days }} days</dd>
+    <dt>Encryption at rest</dt><dd>{{ "AES-256-GCM (key file present)" if ar.encrypted else "off (no key file)" }}</dd>
+    <dt>Not linked</dt><dd>{{ ar.pending }} waiting for log evidence · {{ ar.conflicts }} conflicting</dd>
+  </dl>
+  {% if m.unlinked_archives %}
+  <details class="raw"><summary class="small">Unlinked archived messages ({{ m.unlinked_archives|length }})</summary>
+    <ul class="plain small">{% for u in m.unlinked_archives %}<li><a href="/archives/{{ u.id }}" class="mono">{{ u.queue_id }}</a> · {{ display.ts(u.captured_ts) }} · <span dir="auto">{{ u.subject or "(no subject)" }}</span> · {{ u.link_method }}{% if u.link_note %} — <span class="muted">{{ u.link_note }}</span>{% endif %}</li>{% endfor %}</ul>
+  </details>
+  {% endif %}
+  {% endif %}
+</section>
+
 {% if m.queue and m.queue.ok and m.queue.entries %}
 <section class="card flush">
   <div class="card-head pad"><h2>Queued messages</h2><span class="muted small">oldest first, up to 200</span></div>

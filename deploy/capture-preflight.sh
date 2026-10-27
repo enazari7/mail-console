@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Read-only checks before activating Mail Console message capture in Postfix.
+# Changes nothing in Postfix; prints what it found and the exact proposal.
+#   sudo ./deploy/capture-preflight.sh [--listener NAME ...]
+set -uo pipefail
+ARCHIVE=archive@mail-console.invalid
+SPOOL=/var/spool/mail-console/incoming
+ok() { printf 'ok    %s\n' "$*"; }
+warn() { printf 'warn  %s\n' "$*"; WARN=1; }
+fail() { printf 'FAIL  %s\n' "$*"; FAIL=1; }
+WARN=0; FAIL=0
+[ "$(id -u)" -eq 0 ] || { echo "run as root (read-only checks need postconf/runuser)"; exit 1; }
+command -v postconf >/dev/null || { echo "postconf not found"; exit 1; }
+
+ok "Postfix $(postconf -h mail_version)"
+[ -x /usr/local/libexec/mail-console/mc-capture ] && ok "capture entry point installed" \
+  || fail "/usr/local/libexec/mail-console/mc-capture missing (install or update Mail Console first)"
+id -u mcarchive >/dev/null 2>&1 && ok "capture user mcarchive exists" || fail "user mcarchive missing (run install.sh)"
+if [ -d "$SPOOL" ]; then
+  ok "spool $SPOOL ($(stat -c '%a %U:%G' "$SPOOL"))"
+  FREE=$(df -Pm "$SPOOL" | awk 'NR==2 {print $4}')
+  [ "$FREE" -gt 4096 ] && ok "spool disk: ${FREE} MiB free" || warn "spool disk: only ${FREE} MiB free"
+else
+  fail "spool $SPOOL missing (run install.sh)"
+fi
+/usr/bin/python3 -c 'import sys; assert sys.version_info >= (3, 10)' && ok "system python3 $(/usr/bin/python3 -V 2>&1)" \
+  || fail "/usr/bin/python3 >= 3.10 required by the capture program"
+
+# Capture program dry run into a throw-away directory as the capture user.
+TMP=$(mktemp -d); chown mcarchive "$TMP"
+if printf 'Subject: preflight\n\npreflight\n' | runuser -u mcarchive -- /usr/local/libexec/mail-console/mc-capture \
+     --queue-id=PREFLIGHT01 --sender=preflight@example.invalid --spool="$TMP" --min-free-mb=1; then
+  [ -n "$(ls "$TMP"/*.json 2>/dev/null)" ] && ok "capture program works as mcarchive" || fail "capture wrote no files"
+else
+  fail "capture program exited with status $?"
+fi
+rm -rf "$TMP"
+
+echo "--- current Postfix settings (read-only) ---"
+for p in always_bcc sender_bcc_maps recipient_bcc_maps transport_maps virtual_alias_maps canonical_maps \
+         recipient_canonical_maps smtpd_milters message_size_limit queue_minfree maximal_queue_lifetime; do
+  printf '      %-26s = %s\n' "$p" "$(postconf -h "$p")"
+done
+for map in $(postconf -h virtual_alias_maps recipient_canonical_maps canonical_maps | tr ', ' '\n\n' | grep ':'); do
+  if postmap -q "$ARCHIVE" "$map" >/dev/null 2>&1; then fail "$map rewrites $ARCHIVE; capture would not work"; fi
+done
+[ -n "$(postconf -h always_bcc)" ] && warn "global always_bcc is set; review interaction"
+
+echo "--- listener selection and exact plan (read-only) ---"
+HERE=$(cd "$(dirname "$0")" && pwd)
+if /usr/bin/python3 -I "$HERE/capture_postfix.py" plan "$@"; then
+  ok "a single listener was identified safely (shown above)"
+else
+  fail "the listener to capture could not be identified safely; read the message above and pass --listener NAME"
+fi
+
+echo "--- nothing was changed. Apply only after review: capture_postfix.py apply (docs/MAIL-CAPTURE.md) ---"
+[ "$FAIL" -eq 0 ] || exit 1
+[ "$WARN" -eq 0 ] || exit 2
+exit 0

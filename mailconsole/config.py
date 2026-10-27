@@ -61,6 +61,13 @@ def _list(name: str, default: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _choice(name: str, default: str, allowed: tuple[str, ...]) -> str:
+    value = os.environ.get(name, default).strip().lower() or default
+    if value not in allowed:
+        raise ConfigError(f"{name}: expected one of {', '.join(allowed)}")
+    return value
+
+
 def _units(name: str, default: str) -> list[tuple[str, str]]:
     """Parse "Label=unit.service,Label2=unit2.service"."""
     units = []
@@ -122,6 +129,17 @@ class Config:
     trust_proxy: bool
     allowed_hosts: list[str] = field(default_factory=list)
     store_raw_lines: bool = True
+    archive_enabled: bool = True
+    archive_recipient: str = "archive@mail-console.invalid"
+    archive_spool: Path = Path("/var/spool/mail-console/incoming")
+    archive_dir: Path = Path("/var/lib/mail-console/archive")
+    archive_key_file: Path | None = None
+    archive_retention_days: int = 90
+    archive_max_bytes: int = 10 * 1024**3
+    archive_warn_percent: int = 80
+    archive_min_free_bytes: int = 2 * 1024**3
+    archive_encryption: str = "required"
+    archive_index_body_bytes: int = 2048
 
 
 def load_config() -> Config:
@@ -160,11 +178,22 @@ def load_config() -> Config:
         max_events_per_message=_int("MC_MAX_EVENTS_PER_MESSAGE", 2000, 50),
         queue_reuse_gap_hours=_int("MC_QUEUE_REUSE_GAP_HOURS", 144, 1),
         default_retention_days=_int("MC_RETENTION_DAYS", 90, 1, 3650),
-        max_db_mb=_int("MC_MAX_DB_MB", 2048, 16),
+        max_db_mb=_int("MC_MAX_DB_MB", 3072, 16),
         session_idle_minutes=_int("MC_SESSION_IDLE_MINUTES", 30, 1, 24 * 60),
         session_max_hours=_int("MC_SESSION_MAX_HOURS", 12, 1, 24 * 30),
         cookie_secure=_bool("MC_COOKIE_SECURE", True),
         trust_proxy=_bool("MC_TRUST_PROXY", False),
         allowed_hosts=allowed,
         store_raw_lines=_bool("MC_STORE_RAW_LINES", True),
+        archive_enabled=_bool("MC_ARCHIVE_ENABLED", True),
+        archive_recipient=os.environ.get("MC_ARCHIVE_RECIPIENT", "archive@mail-console.invalid").strip().lower(),
+        archive_spool=Path(os.environ.get("MC_ARCHIVE_SPOOL", "/var/spool/mail-console/incoming")),
+        archive_dir=Path(os.environ.get("MC_ARCHIVE_DIR", str(data_dir / "archive"))),
+        archive_key_file=Path(os.environ.get("MC_ARCHIVE_KEY_FILE", "/etc/mail-console/archive.key")),
+        archive_retention_days=_int("MC_ARCHIVE_RETENTION_DAYS", 90, 1, 3650),
+        archive_max_bytes=_int("MC_ARCHIVE_MAX_GB", 8, 1, 100_000) * 1024**3,
+        archive_warn_percent=_int("MC_ARCHIVE_WARN_PERCENT", 80, 10, 99),
+        archive_min_free_bytes=_int("MC_ARCHIVE_MIN_FREE_MB", 4096, 64) * 1024**2,
+        archive_encryption=_choice("MC_ARCHIVE_ENCRYPTION", "required", ("required", "off")),
+        archive_index_body_bytes=_int("MC_ARCHIVE_INDEX_BODY_BYTES", 2048, 0, 1024 * 1024),
     )

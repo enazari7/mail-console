@@ -242,3 +242,169 @@ def csrf_matches(expected: str | None, supplied: str | None) -> bool:
     if not expected or not supplied:
         return False
     return hmac.compare_digest(expected.encode(), supplied.encode())
+
+
+# --- TOTP second factor (RFC 6238: SHA-1, 30 s, 6 digits) ---------------------
+
+import base64 as _base64  # noqa: E402
+import struct as _struct  # noqa: E402
+import time as _time  # noqa: E402
+from urllib.parse import quote as _quote  # noqa: E402
+
+TOTP_STEP = 30
+TOTP_DIGITS = 6
+TOTP_WINDOW = 1            # accept one step of clock drift either side
+PENDING_LOGIN_SECONDS = 300
+PENDING_LOGIN_ATTEMPTS = 5
+
+
+def totp_new_secret() -> str:
+    return _base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def _totp_at(secret: str, counter: int) -> str:
+    key = _base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    digest = hmac.new(key, _struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = (_struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 10 ** TOTP_DIGITS
+    return f"{value:0{TOTP_DIGITS}d}"
+
+
+def totp_now(secret: str, at: float | None = None) -> str:
+    return _totp_at(secret, int((at if at is not None else _time.time()) // TOTP_STEP))
+
+
+def totp_match(secret: str, code: str, at: float | None = None, after_counter: int | None = None) -> int | None:
+    """Return the matching time step for ``code``, or None. Steps <= after_counter are rejected (replay)."""
+    code = "".join(ch for ch in (code or "") if ch.isdigit())
+    if len(code) != TOTP_DIGITS:
+        return None
+    now = int((at if at is not None else _time.time()) // TOTP_STEP)
+    for counter in range(now - TOTP_WINDOW, now + TOTP_WINDOW + 1):
+        if after_counter is not None and counter <= after_counter:
+            continue
+        if hmac.compare_digest(_totp_at(secret, counter), code):
+            return counter
+    return None
+
+
+def totp_uri(secret: str, username: str) -> str:
+    label = _quote(f"BeastPing Mail Console:{username}")
+    return f"otpauth://totp/{label}?secret={secret}&issuer={_quote('BeastPing Mail Console')}&digits=6&period=30"
+
+
+def totp_secret_of(conn: sqlite3.Connection, admin_id: int) -> str | None:
+    row = conn.execute("SELECT totp_secret FROM admins WHERE id = ?", (admin_id,)).fetchone()
+    return row[0] if row else None
+
+
+def totp_check(conn: sqlite3.Connection, admin_id: int, code: str) -> bool:
+    """Verify a code for an admin and consume its time step (no replay, even under concurrency)."""
+    row = conn.execute("SELECT totp_secret, totp_last_counter FROM admins WHERE id = ?", (admin_id,)).fetchone()
+    if row is None or not row[0]:
+        return False
+    counter = totp_match(row[0], code, after_counter=row[1])
+    if counter is None:
+        return False
+    with tx(conn):
+        cur = conn.execute("UPDATE admins SET totp_last_counter = ? WHERE id = ?"
+                           " AND (totp_last_counter IS NULL OR totp_last_counter < ?)", (counter, admin_id, counter))
+    return cur.rowcount == 1
+
+
+TOTP_MAX_FAILURES = 10          # per administrator per WINDOW_US, regardless of client address
+
+
+def _totp_key(admin_id: int) -> str:
+    return _username_key(f"totp-failure:{admin_id}")
+
+
+def totp_allowed(conn: sqlite3.Connection, admin_id: int) -> bool:
+    count = conn.execute("SELECT count(*) FROM login_attempts WHERE username_hash = ? AND success = 0 AND ts >= ?",
+                         (_totp_key(admin_id), now_us() - WINDOW_US)).fetchone()[0]
+    return count < TOTP_MAX_FAILURES
+
+
+def record_totp_failure(conn: sqlite3.Connection, admin_id: int, client_ip: str) -> None:
+    """Counted per administrator; a later correct password does not clear it."""
+    with tx(conn):
+        conn.execute("INSERT INTO login_attempts(ts, client_ip, username_hash, success) VALUES (?, ?, ?, 0)",
+                     (now_us(), f"totp:{client_ip}", _totp_key(admin_id)))
+
+
+def discard_attempt(conn: sqlite3.Connection, attempt_id: int) -> None:
+    """The password was right but a second factor is still required: neither a failure nor a success."""
+    with tx(conn):
+        conn.execute("DELETE FROM login_attempts WHERE id = ?", (attempt_id,))
+
+
+TOTP_SETUP_SECONDS = 600
+
+
+def totp_begin_setup(conn: sqlite3.Connection, admin_id: int) -> str:
+    """Create a pending secret on the server; only it can be confirmed."""
+    from .db import set_setting
+    secret = totp_new_secret()
+    with tx(conn):
+        set_setting(conn, f"totp_pending:{admin_id}", f"{secret}:{now_us() + TOTP_SETUP_SECONDS * 1_000_000}")
+    return secret
+
+
+def totp_confirm_setup(conn: sqlite3.Connection, admin_id: int, code: str) -> bool:
+    from .db import get_setting
+    value = get_setting(conn, f"totp_pending:{admin_id}")
+    if not value:
+        return False
+    secret, _, expires = value.partition(":")
+    if not expires.isdigit() or int(expires) < now_us():
+        return False
+    if not totp_enable(conn, admin_id, secret, code):
+        return False
+    with tx(conn):
+        conn.execute("DELETE FROM settings WHERE key = ?", (f"totp_pending:{admin_id}",))
+    return True
+
+
+def totp_enable(conn: sqlite3.Connection, admin_id: int, secret: str, code: str) -> bool:
+    counter = totp_match(secret, code)
+    if counter is None:
+        return False
+    with tx(conn):
+        conn.execute("UPDATE admins SET totp_secret = ?, totp_last_counter = ? WHERE id = ?",
+                     (secret, counter, admin_id))
+    return True
+
+
+def totp_disable(conn: sqlite3.Connection, admin_id: int) -> None:
+    with tx(conn):
+        conn.execute("UPDATE admins SET totp_secret = NULL, totp_last_counter = NULL WHERE id = ?", (admin_id,))
+
+
+def create_pending_login(conn: sqlite3.Connection, admin_id: int, client_ip: str | None) -> str:
+    token = secrets.token_urlsafe(32)
+    ts = now_us()
+    with tx(conn):
+        conn.execute("DELETE FROM pending_logins WHERE expires_ts < ?", (ts,))
+        conn.execute("INSERT INTO pending_logins(token_hash, admin_id, created_ts, expires_ts, client_ip)"
+                     " VALUES (?, ?, ?, ?, ?)",
+                     (_token_hash(token), admin_id, ts, ts + PENDING_LOGIN_SECONDS * 1_000_000, client_ip))
+    return token
+
+
+def take_pending_login(conn: sqlite3.Connection, token: str | None) -> tuple[bytes, int] | None:
+    """Return (token hash, admin id) for a live pending login and count the attempt."""
+    if not token or len(token) > 128:
+        return None
+    th = _token_hash(token)
+    row = conn.execute("SELECT admin_id, expires_ts, attempts FROM pending_logins WHERE token_hash = ?",
+                       (th,)).fetchone()
+    if row is None or row["expires_ts"] < now_us() or row["attempts"] >= PENDING_LOGIN_ATTEMPTS:
+        return None
+    with tx(conn):
+        conn.execute("UPDATE pending_logins SET attempts = attempts + 1 WHERE token_hash = ?", (th,))
+    return th, row["admin_id"]
+
+
+def finish_pending_login(conn: sqlite3.Connection, token_hash: bytes) -> None:
+    with tx(conn):
+        conn.execute("DELETE FROM pending_logins WHERE token_hash = ?", (token_hash,))

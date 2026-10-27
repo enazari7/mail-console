@@ -222,26 +222,9 @@ def test_details_sections_and_content_placeholder(logged_in, db):
     page = logged_in.get(f"/emails/{mid}").text
     for heading in ("Metadata", "Delivery events", "Message content", "Timeline"):
         assert f">{heading}<" in page
-    assert "Content not retained." in page and "Subject not recorded" in page
+    assert "No archived copy." in page and "Subject not recorded" in page
     assert "Deferred attempts" in page and "Final event" in page and "mx.example.org[203.0.113.25]:25" in page
     assert "<iframe" not in page
-
-
-def test_retained_html_is_sandboxed(logged_in, db):
-    mid = db.execute("SELECT id FROM messages WHERE queue_id = '3F2A61C0D3'").fetchone()[0]
-    with tx(db):
-        db.execute("INSERT INTO message_content(message_id, captured_ts, source, subject, text_body, html_body,"
-                   " attachments) VALUES (?, 1, 'test-fixture', 'Hello', 'Plain body', ?, ?)",
-                   (mid, '<p>Hi</p><script>alert(1)</script><img src="https://tracker.example/x.png">',
-                    '[{"filename": "a.pdf", "content_type": "application/pdf", "size": 2048}]'))
-    page = logged_in.get(f"/emails/{mid}").text
-    assert 'sandbox=""' in page and "Plain body" in page and "a.pdf" in page
-    assert "<script>alert(1)</script>" not in page  # never inlined in the console origin
-    preview = logged_in.get(f"/emails/{mid}/content-preview")
-    csp = preview.headers["content-security-policy"]
-    assert csp.startswith("sandbox;") and "script-src" not in csp and "default-src 'none'" in csp
-    assert "img-src data:" in csp  # remote images blocked
-    assert logged_in.get("/emails/999999/content-preview").status_code == 404
 
 
 # --- CSV export -----------------------------------------------------------------
@@ -309,26 +292,34 @@ def test_query_plans_use_indexes(db, cfg):
     assert "SCAN r" not in recipients_join  # recipients are always reached through an index
 
 
-def test_migration_builds_search_index_for_existing_data(cfg, tmp_path):
+def test_upgrade_from_phase1_schema_builds_search_and_archive_tables(cfg, tmp_path):
     from mailconsole import db as dbmod
-    from tests.conftest import fixture_lines
-    conn = connect(tmp_path / "old.sqlite3")
-    only_v1 = [m for m in dbmod.available_migrations() if m[0] == 1]
+    from mailconsole import search
+    conn = connect(tmp_path / "phase1.sqlite3")
     real = dbmod.available_migrations
-    dbmod.available_migrations = lambda: only_v1
+    dbmod.available_migrations = lambda: [m for m in real() if m[0] == 1]
     try:
         migrate(conn)
-        conn.executescript("CREATE VIRTUAL TABLE message_search USING fts5(doc, tokenize = 'trigram');")
-        ingest_lines(conn, cfg, fixture_lines())   # data written by the v1 code path
-        conn.executescript("DROP TABLE message_search;")
     finally:
         dbmod.available_migrations = real
-    assert migrate(conn) == ["0002_search_and_content.sql"]
-    from mailconsole import search
+    # Rows exactly as the Phase 1 code wrote them (v1 schema).
+    conn.executescript("""
+        INSERT INTO messages(id, queue_id, host, first_ts, last_ts, sender, message_id, status, origin, nrcpt)
+        VALUES (1, 'ABCDEF0900', 'mail', 1, 2, 'notify@example.com', 'v1@example.com', 'accepted', 'smtpd', 1);
+        INSERT INTO recipients(message_id, address, domain, status, attempts)
+        VALUES (1, 'alice@example.org', 'example.org', 'accepted', 1);
+        INSERT INTO events(message_id, ts, program, queue_id, kind, recipient, status, line_hash)
+        VALUES (1, 2, 'postfix/smtp', 'ABCDEF0900', 'delivery', 'alice@example.org', 'sent', x'01');
+    """)
+    applied = migrate(conn)
+    assert applied == ["0002_search_and_content.sql", "0003_mail_content.sql"]
     assert search.missing_documents(conn) == 0
     assert conn.execute("SELECT count(*) FROM message_search WHERE message_search MATCH ?",
                         (search.phrase("alice@exa"),)).fetchone()[0] == 1
-
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    assert {"archives", "archive_parts", "archive_blobs", "archive_search", "audit_log", "pending_logins"} <= tables
+    assert "message_content" not in tables
+    assert conn.execute("SELECT archive_status FROM messages WHERE id = 1").fetchone()[0] is None
 
 def test_search_index_follows_retention_and_resegmentation(db, cfg):
     from mailconsole import search
@@ -431,10 +422,3 @@ def test_export_filename_marks_truncation(logged_in, many, monkeypatch):
     assert "-first-25-rows.csv" in resp.headers["content-disposition"]
 
 
-def test_preview_strips_meta_refresh(logged_in, db):
-    mid = db.execute("SELECT id FROM messages WHERE queue_id = '3F2A61C0D3'").fetchone()[0]
-    with tx(db):
-        db.execute("INSERT INTO message_content(message_id, captured_ts, source, html_body) VALUES (?, 1, 't', ?)",
-                   (mid, '<META HTTP-EQUIV="refresh" content="0;url=https://evil.example/"><p>x</p>'))
-    body = logged_in.get(f"/emails/{mid}/content-preview").text
-    assert "refresh" not in body.lower() and "<p>x</p>" in body

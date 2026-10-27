@@ -5,7 +5,10 @@ existing Postfix server. It reads Postfix log lines, correlates them into
 messages and recipients, and shows activity, delivery outcomes, SMTP responses
 and server health in a web interface inspired by Resend's dashboard.
 
-It **does not send, relay or modify mail**. It never changes Postfix, Dovecot,
+It **does not send, relay or modify mail**. Optional message capture (see
+[docs/MAIL-CAPTURE.md](docs/MAIL-CAPTURE.md)) needs a separately reviewed
+Postfix change that adds a hidden archive copy; mail delivery never depends on
+the console. It never changes Postfix, Dovecot,
 OpenDKIM, Mailguard, DNS or firewall settings, and it never restarts mail
 services. It reads logs and runs two read-only status commands.
 
@@ -19,7 +22,9 @@ Phase 1 scope and its limits are listed under [Limitations](#limitations).
 | **Emails** | One row per recipient: recipient (with sender), status, subject (only when Postfix logs it), relative "sent" time with the exact time on hover, and an actions menu (open, copy Queue ID, copy Message-ID). Toolbar: search, time range (24h/7d/15d/30d/90d/custom), status, sender (picked from senders actually seen) and CSV export. Filters combine with AND, live in the URL (bookmarkable) and survive paging and sorting. Sort by sent time, recipient or status; server-side pagination; whole rows are clickable. |
 | **Email details** | Metadata (sender, recipients, subject, Message-ID, Queue ID, status, first/last/final timestamps, attempts, deferred attempts, relay, DSN), Delivery events (per-recipient table and a timeline of every log line, raw line included, redacted), related messages, and a Message content section that reads "Content not retained" unless an approved capture mechanism stored content. Missing evidence is stated explicitly. |
 | **Monitoring** | Postfix, Mailguard, OpenDKIM and Dovecot unit state; queue size by queue, oldest message, queued entries with deferral reasons; collector health and checkpoint; recent operational warnings/errors from the logs. Read-only. |
-| **Settings** | Administrator account, password change, active sessions, data retention, time zone, page size, theme (system/dark/light). |
+| **Message content** | For mail captured after the reviewed Postfix change (docs/MAIL-CAPTURE.md): the complete original message — headers vs. SMTP envelope, plain-text and sandboxed HTML views with embedded images, attachments, raw headers and the original `.eml` download. Every view and download is audited. |
+| **Settings** | Administrator account, password change, optional TOTP two-factor authentication, active sessions, history and archive retention, time zone, page size, theme (system/dark/light). |
+| **Audit log** | Sign-ins, failed sign-ins, 2FA changes and every view or download of archived content. |
 
 ### Status meanings
 
@@ -115,7 +120,7 @@ SMTP responses of failed recipients.
 ### Growth controls
 
 * Retention (default 90 days, Settings) deletes messages by last activity, hourly.
-* `MC_MAX_DB_MB` (default 2048) caps live database size; oldest history goes first.
+* `MC_MAX_DB_MB` (default 3072) caps live database size; the archived-content search index is trimmed first, then the oldest history (never the last day).
 * `MC_MAX_EVENTS_PER_MESSAGE` caps stored retry events per message; final outcomes
   are always kept and the detail page says when counts are lower bounds.
 * Queue snapshots keep counts for 14 days and the entry list only for the latest.
@@ -153,6 +158,8 @@ All commands run as the service user through the `/usr/local/sbin/mail-console` 
 | `mail-console migrate` | Apply database migrations |
 | `mail-console purge` | Apply retention now |
 | `mail-console reindex` | Rebuild the full-text search index (normally maintained automatically) |
+| `mail-console archive status` / `verify` | Archive health; re-hash and decrypt every stored message |
+| `mail-console admin totp-disable --username U` | Remove 2FA for an administrator (recovery) |
 | `mail-console serve` / `collect` | What the systemd units run |
 
 ## Development
@@ -205,16 +212,16 @@ uninstall cycle on an Ubuntu 24.04 ARM64 runner without Docker.
   first queue file and linked to the queue file it continues as; both count in
   the overview totals. (Mailguard is a milter, so the current setup has no such
   hand-off.)
-* **Subjects** appear only if Postfix logs them (requires a `header_checks`
-  change that is out of scope).
-* **Single role.** Every account is a full administrator; there is no 2FA.
-  Use an SSH tunnel or a reverse proxy with network restrictions.
+* **Subjects and content** are available for messages captured after the
+  Postfix capture change is activated; older messages show log data only.
+* **Single role.** Every account is a full administrator. TOTP 2FA is optional;
+  use it, and an SSH tunnel or a restricted HTTPS reverse proxy.
 * **Search** is case-insensitive including non-ASCII letters; substring matching needs 3+ characters; status-only filters over
   long ranges walk that range (see [Search](#search)). Counts are capped at 10,000.
 * **Receiving** (inbound mail) is not tracked; the tab is shown as unavailable.
-* **Message content** is not captured. The UI and a `message_content` table are
-  ready for a future, separately approved capture service; HTML would render only
-  in a sandboxed, script-free frame with remote resources blocked.
+* **Message capture** covers authenticated submission only (not inbound mail,
+  local `sendmail` or Postfix notices). It is inactive until the Postfix change in
+  docs/MAIL-CAPTURE.md is reviewed and applied.
 * **Charts** bucket by the display zone's UTC offset at the end of the range;
   across a DST change, day buckets shift by an hour.
 * **journald source** is implemented and tested with a simulated `journalctl`;

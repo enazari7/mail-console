@@ -1,0 +1,22 @@
+#!/bin/sh
+# Postfix pipe(8) entry point for Mail Console message capture.
+#
+# Installed at a stable path (/usr/local/libexec/mail-console/mc-capture) that
+# release switches, rollbacks and a normal uninstall leave in place. It runs
+# the standard-library-only capture program with the system Python in isolated
+# mode: no virtualenv, no console services and no database are involved.
+#
+# Exit status is 0 (stored, or skip recorded) or 75 (temporary failure: Postfix
+# retries only the archive copy). Any other status would make pipe(8) drop the
+# copy permanently, so every failure, including a missing program, maps to 75.
+SCRIPT=/opt/mail-console/current/mailconsole/capture.py
+if [ ! -r "$SCRIPT" ]; then
+  echo "mail-console capture deferred: $SCRIPT is missing" >&2
+  exit 75
+fi
+/usr/bin/python3 -I "$SCRIPT" "$@"
+status=$?
+if [ "$status" -eq 0 ]; then
+  exit 0
+fi
+exit 75

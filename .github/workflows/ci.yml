@@ -26,7 +26,7 @@ jobs:
           python -m pip install --require-hashes --only-binary=:all: -r requirements.lock
           python -m pip install -r requirements-dev.txt
       - run: uname -m && python -c "import platform; print(platform.machine(), platform.python_version())"
-      - run: ruff check mailconsole tests scripts deploy/smoke_test.py
+      - run: ruff check mailconsole tests scripts deploy/smoke_test.py deploy/capture_postfix.py
       - run: python -m pytest -p no:cacheprovider
       - run: shellcheck -S warning deploy/*.sh scripts/*.sh
 
@@ -113,3 +113,176 @@ jobs:
       - name: Service logs
         if: failure()
         run: sudo journalctl -u mail-console-web -u mail-console-collector --no-pager -n 200
+
+  capture-e2e:
+    # Real Postfix 3.8 (CI runner only) shaped like production: two named
+    # submission listeners (public IP and loopback) with Dovecot SASL, required
+    # TLS, restrictions and milter options, plus an existing transport map.
+    # The capture change is applied with deploy/capture_postfix.py exactly as
+    # documented for production, then fully reversed.
+    name: postfix capture e2e (${{ matrix.os }})
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    env:
+      ADMIN_PASSWORD: ci-only-password-${{ github.run_id }}
+      PUBLIC: 192.0.2.10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Postfix and Dovecot SASL (CI runner only)
+        run: |
+          echo "postfix postfix/main_mailer_type select Local only" | sudo debconf-set-selections
+          echo "postfix postfix/mailname string ci.example.org" | sudo debconf-set-selections
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            postfix dovecot-core ssl-cert python3.12-venv >/dev/null
+          sudo make-ssl-cert generate-default-snakeoil --force-overwrite
+          postconf -h mail_version
+          sudo ip addr add "$PUBLIC/32" dev lo
+          printf '%s\n' 'protocols = none' 'auth_mechanisms = plain login' 'disable_plaintext_auth = no' \
+            'passdb {' '  driver = passwd-file' '  args = scheme=PLAIN username_format=%u /etc/dovecot/ci-users' '}' \
+            'userdb {' '  driver = static' '  args = uid=nobody gid=nogroup home=/nonexistent' '}' \
+            'service auth {' '  unix_listener /var/spool/postfix/private/auth {' '    mode = 0660' \
+            '    user = postfix' '    group = postfix' '  }' '}' | sudo tee /etc/dovecot/local.conf >/dev/null
+          echo 'app@ci.example.org:{PLAIN}ci-secret' | sudo tee /etc/dovecot/ci-users >/dev/null
+          sudo systemctl restart dovecot
+          sudo install -m 0640 -o root -g adm /dev/null /var/log/postfix.log
+          sudo postconf -e maillog_file=/var/log/postfix.log \
+            smtpd_tls_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
+            smtpd_tls_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+          # Existing routing that must survive (stands in for the bounce collector).
+          echo 'bounces@ci.example.org  discard:' | sudo tee /etc/postfix/transport >/dev/null
+          sudo postmap /etc/postfix/transport
+          sudo postconf -e transport_maps=hash:/etc/postfix/transport
+          # Production-style named submission listeners.
+          for host in "$PUBLIC" 127.0.0.1; do
+            echo "$host:submission inet n - y - - smtpd -o syslog_name=postfix/submission-$host -o smtpd_tls_security_level=encrypt -o smtpd_sasl_auth_enable=yes -o smtpd_sasl_type=dovecot -o smtpd_sasl_path=private/auth -o smtpd_tls_auth_only=yes -o smtpd_client_restrictions=permit_sasl_authenticated,reject -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject -o smtpd_milters=inet:127.0.0.1:8891 -o milter_default_action=accept -o milter_macro_daemon_name=ORIGINATING" \
+              | sudo tee -a /etc/postfix/master.cf >/dev/null
+          done
+          sudo postfix check
+          sudo systemctl restart postfix
+          sudo postconf -M | grep submission
+      - name: Install Mail Console
+        run: |
+          sudo install -d -m 0755 /etc/mail-console
+          sed -e 's#^MC_LOG_PATH=.*#MC_LOG_PATH=/var/log/postfix.log#' -e 's#^MC_POLL_INTERVAL=.*#MC_POLL_INTERVAL=1#' \
+            .env.example | sudo tee /etc/mail-console/mail-console.env >/dev/null
+          sudo ./deploy/install.sh
+          echo "$ADMIN_PASSWORD" | sudo mail-console admin create --username admin --password-stdin
+      - name: Preflight and plan (read-only)
+        run: |
+          sudo postconf -n > /tmp/n.before; sudo postconf -M > /tmp/M.before; sudo postconf -P > /tmp/P.before
+          sudo cp /etc/postfix/main.cf /tmp/main.cf.before
+          sudo ./deploy/capture-preflight.sh || [ $? -eq 2 ]
+          sudo python3 -I deploy/capture_postfix.py plan | tee /tmp/plan.txt
+          grep -q "$PUBLIC:submission/inet.*<- capture" /tmp/plan.txt
+          grep -q "127.0.0.1:submission/inet.*loopback: not captured" /tmp/plan.txt
+          sudo postconf -n | diff /tmp/n.before - && sudo postconf -M | diff /tmp/M.before -   # plan changed nothing
+          # A generic name that does not exist is refused, never created.
+          ! sudo python3 -I deploy/capture_postfix.py plan --listener submission
+      - name: Apply (as documented) and verify
+        run: |
+          sudo python3 -I deploy/capture_postfix.py apply --yes
+          sudo postfix reload
+          sudo python3 -I deploy/capture_postfix.py status
+          test "$(sudo postconf -P "$PUBLIC:submission/inet/cleanup_service_name")" = \
+               "$PUBLIC:submission/inet/cleanup_service_name = cleanup-archive"
+          test -z "$(sudo postconf -P 127.0.0.1:submission/inet/cleanup_service_name 2>/dev/null)"
+          test "$(sudo postconf -M cleanup/unix | awk '{print $3,$4,$5,$6,$7}')" = \
+               "$(sudo postconf -M cleanup-archive/unix | awk '{print $3,$4,$5,$6,$7}')"
+          test "$(sudo postmap -q bounces@ci.example.org hash:/etc/postfix/transport)" = "discard:"
+          sudo postconf -h transport_maps
+      - name: Public listener is archived, loopback is not, everyone is delivered
+        run: |
+          python3 scripts/send_test_mail.py --host "$PUBLIC" --port 587 --starttls --user app@ci.example.org \
+            --password ci-secret --to root@localhost --to postmaster@localhost
+          python3 scripts/send_test_mail.py --host 127.0.0.1 --port 587 --starttls --user app@ci.example.org \
+            --password ci-secret --to root@localhost --only-plain --tag LOOPBACK-CI
+          sleep 12
+          sudo grep -E "archive@mail-console.invalid|status=" /var/log/postfix.log | tail -n 14
+          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 2
+          test -z "$(sudo ls -A /var/spool/mail-console/incoming)"
+          sudo mail-console archive verify
+          test "$(sudo postqueue -j | wc -l)" = 0
+          ! sudo grep -q "status=bounced\|status=deferred" /var/log/postfix.log
+          echo "$ADMIN_PASSWORD" | python3 deploy/smoke_test.py --username admin --password-stdin \
+            --expect-archive ACTIVATION-CI --expect-archive PLAIN-CI-BODY
+          # The loopback submission was delivered and has no archive copy.
+          LQ=$(sudo grep "postfix/submission-127.0.0.1/smtpd.*client=" /var/log/postfix.log | tail -1 | sed -E 's/.*\]: ([0-9A-F]+): client=.*/\1/')
+          test -n "$LQ"
+          sudo grep "$LQ: to=<root@localhost>.*status=sent" /var/log/postfix.log
+          ! sudo grep -q "$LQ: to=<archive@mail-console.invalid>" /var/log/postfix.log
+      - name: A broken capture defers only the archive copy, never bounces
+        run: |
+          sudo chmod 0000 /var/spool/mail-console/incoming
+          python3 scripts/send_test_mail.py --host "$PUBLIC" --port 587 --starttls --user app@ci.example.org \
+            --password ci-secret --to root@localhost --only-plain --tag BROKEN-CI
+          sleep 10
+          sudo grep -E "BROKEN-CI|status=" /var/log/postfix.log | tail -n 6
+          QID=$(sudo grep "to=<archive@mail-console.invalid>.*status=deferred" /var/log/postfix.log | tail -1 | sed -E 's/.*\]: ([0-9A-F]+):.*/\1/')
+          test -n "$QID"
+          sudo grep "$QID: to=<root@localhost>.*status=sent" /var/log/postfix.log
+          ! sudo grep -q "$QID: sender non-delivery notification" /var/log/postfix.log
+          ! sudo grep -q "$QID: to=<root@localhost>.*status=\(bounced\|deferred\)" /var/log/postfix.log
+          sudo mail-console archive status | grep -E "deferred_copies|level"
+          sudo chmod 2770 /var/spool/mail-console/incoming
+          sudo postqueue -f     # CI only: retry the deferred archive copy now
+          sleep 8
+          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 3
+          test "$(sudo postqueue -j | wc -l)" = 0
+      - name: Two-phase deactivation waits for queued copies and restores the exact previous configuration
+        run: |
+          # Hold one archive copy in the queue, as after a capture outage.
+          sudo chmod 0000 /var/spool/mail-console/incoming
+          python3 scripts/send_test_mail.py --host "$PUBLIC" --port 587 --starttls --user app@ci.example.org \
+            --password ci-secret --to root@localhost --only-plain --tag HELD-CI
+          sleep 10
+          test "$(sudo postqueue -j | grep -c 'archive@mail-console.invalid')" = 1
+          # The process check in 'finish' relies on master passing -n NAME / -o options to its children.
+          sudo ps -eo args= | grep -E '[c]leanup_service_name=cleanup-archive|-n [c]leanup-archive'
+          sudo python3 -I deploy/capture_postfix.py deactivate
+          sudo postfix reload
+          sudo python3 -I deploy/capture_postfix.py status | tee /tmp/status.txt
+          grep -q "archive copies still queued: 1" /tmp/status.txt
+          # Phase 2 refuses while the copy is queued (after old children have exited following the reload).
+          for _ in $(seq 30); do
+            rc=0; sudo python3 -I deploy/capture_postfix.py deactivate --finish 2>/tmp/finish.err || rc=$?
+            grep -q "running Postfix process" /tmp/finish.err || break
+            sleep 2
+          done
+          cat /tmp/finish.err
+          test "$rc" = 2
+          grep -q "1 queued message(s) still carry the archive copy" /tmp/finish.err
+          ! sudo ps -eo args= | grep -E '[c]leanup_service_name=cleanup-archive'
+          # Deliver it to the archive, then finish.
+          sudo chmod 2770 /var/spool/mail-console/incoming
+          sudo postqueue -f     # CI only: retry the deferred archive copy now
+          sleep 8
+          test "$(sudo postqueue -j | wc -l)" = 0
+          for _ in $(seq 30); do
+            sudo python3 -I deploy/capture_postfix.py deactivate --finish && break
+            sleep 2
+          done
+          test ! -e /etc/postfix/mailconsole-capture.json
+          sudo postfix reload
+          # Exact restore: postconf views, main.cf byte for byte, no leftover (even unused) parameter.
+          sudo postconf -n | diff /tmp/n.before -
+          sudo postconf -M | diff /tmp/M.before -
+          sudo postconf -P | diff /tmp/P.before -
+          sudo diff /tmp/main.cf.before /etc/postfix/main.cf
+          test -z "$(sudo postconf -n 2>&1 >/dev/null)"
+          ! sudo grep -E 'cleanup-archive|mailconsole' /etc/postfix/main.cf /etc/postfix/master.cf
+          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 4
+          python3 scripts/send_test_mail.py --host "$PUBLIC" --port 587 --starttls --user app@ci.example.org \
+            --password ci-secret --to root@localhost --only-plain --tag AFTER-CI
+          sleep 8
+          test "$(sudo mail-console archive status | awk '$1=="archives"{print $2}')" = 4
+          sudo grep "status=sent" /var/log/postfix.log | tail -n 2
+      - name: Logs
+        if: failure()
+        run: |
+          sudo tail -n 120 /var/log/postfix.log || true
+          sudo journalctl -u mail-console-web -u mail-console-collector -u dovecot --no-pager -n 120
+          sudo ls -laR /var/spool/mail-console || true

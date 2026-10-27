@@ -346,8 +346,14 @@ class Classified:
     attach_only: bool = False   # milter/opendkim info: attach to an open message, never create
 
 
-def classify(record: LogRecord, postfix_prefixes: list[str], ops_programs: list[str]) -> Classified | None:
-    """Decide what, if anything, a syslog record means to the console."""
+def classify(record: LogRecord, postfix_prefixes: list[str], ops_programs: list[str],
+             archive_recipient: str | None = None) -> Classified | None:
+    """Decide what, if anything, a syslog record means to the console.
+
+    Deliveries to ``archive_recipient`` (the Mail Console archive copy added by
+    always_bcc) become ``archive_delivery`` events, so they never count as a
+    real recipient.
+    """
     program = record.program
     if any(program == p or program.startswith(p + "/") or program.startswith(p + "-") for p in postfix_prefixes):
         daemon = program.rsplit("/", 1)[-1]
@@ -356,6 +362,9 @@ def classify(record: LogRecord, postfix_prefixes: list[str], ops_programs: list[
             return None
         if isinstance(parsed, OpsEvent):
             return Classified(record, ops=parsed)
+        if (archive_recipient and parsed.kind == "delivery" and parsed.recipient
+                and parsed.recipient.lower() == archive_recipient):
+            parsed.kind = "archive_delivery"
         return Classified(record, event=parsed)
 
     base = program.split("/", 1)[0].lower()

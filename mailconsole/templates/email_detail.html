@@ -10,7 +10,7 @@
   {{ mail_icon(m.status) }}
   <div class="detail-title">
     <p class="eyebrow">Email</p>
-    <h1 dir="auto">{% if m.subject %}{{ m.subject }}{% elif d.content and d.content.subject %}{{ d.content.subject }}{% else %}<span class="na-title">Subject not recorded</span>{% endif %}</h1>
+    <h1 dir="auto">{% if m.subject %}{{ m.subject }}{% elif content and content.archive and content.archive.subject %}{{ content.archive.subject }}{% else %}<span class="na-title">Subject not recorded</span>{% endif %}</h1>
     <p class="detail-route">
       <span title="Sender">{{ addr(m.sender) }}</span>
       <span class="arrow" aria-hidden="true">→</span>
@@ -30,7 +30,7 @@
   <div class="meta-grid">
     <div class="kv"><span class="k">From</span><span class="v">{{ addr(m.sender) }}</span></div>
     <div class="kv"><span class="k">To</span><span class="v">{% for r in d.recipients %}{{ r.address }}{% if not loop.last %}, {% endif %}{% else %}<span class="unknown">not in delivery records</span>{% endfor %}</span></div>
-    <div class="kv"><span class="k">Subject</span><span class="v" dir="auto">{% if m.subject %}{{ m.subject }}{% else %}<span class="na">Not recorded</span>{% endif %}</span></div>
+    <div class="kv"><span class="k">Subject</span><span class="v" dir="auto">{% if m.subject %}{{ m.subject }}{% elif content and content.archive and content.archive.subject %}{{ content.archive.subject }} <span class="muted small">(from archived copy)</span>{% else %}<span class="na">Not recorded</span>{% endif %}</span></div>
     <div class="kv"><span class="k">Message-ID</span><span class="v mono wrap">{% if m.message_id %}&lt;{{ m.message_id }}&gt; <button type="button" class="copy-inline" data-copy="&lt;{{ m.message_id }}&gt;" title="Copy">{{ icon("copy", 14) }}<span class="sr-only">Copy</span></button>{% else %}<span class="unknown">not logged</span>{% endif %}</span></div>
     <div class="kv"><span class="k">Queue ID</span><span class="v mono">{% if m.queue_id %}{{ m.queue_id }} <button type="button" class="copy-inline" data-copy="{{ m.queue_id }}" title="Copy">{{ icon("copy", 14) }}<span class="sr-only">Copy</span></button>{% else %}<span class="muted" title="Rejected before a queue file was created">NOQUEUE</span>{% endif %}</span></div>
     <div class="kv"><span class="k">Status</span><span class="v">{{ badge(m.status) }}</span></div>
@@ -99,27 +99,24 @@
   </div>
 </section>
 
-<section class="card section" aria-labelledby="h-content">
-  <div class="card-head"><h2 id="h-content">Message content</h2>{% if d.content %}<span class="muted small">retained {{ display.ts(d.content.captured_ts) }} by {{ d.content.source }}</span>{% endif %}</div>
-  {% if not d.content %}
+<section class="card section" id="content" aria-labelledby="h-content">
+  <div class="card-head"><h2 id="h-content">Message content</h2>{% if d.archives|length > 1 %}<span class="muted small">{{ d.archives|length }} archived copies; showing the first</span>{% endif %}</div>
+  {% if content %}
+    {% set envelope_sender = m.sender %}
+    {% set envelope_rcpts = d.recipients|map(attribute="address")|list %}
+    {% include "_content.html" %}
+  {% elif d.skips %}
+  <div class="banner error"><strong>The archive copy of this message was not stored.</strong>
+    {% for k in d.skips %}<br>{{ display.ts(k.captured_ts) }}: {{ k.reason }}{% if k.size %} ({{ k.size|human_bytes }}){% endif %}{% endfor %}
+    <br><span class="small">Delivery to the recipients was not affected.</span></div>
+  {% else %}
   <div class="content-empty">
     <span class="empty-icon">{{ icon("lock") }}</span>
     <div>
-      <p><strong>Content not retained.</strong></p>
-      <p class="muted small">This console reads Postfix logs only. Subject, body and attachments are shown here only if an approved content-capture mechanism stored them; none is enabled. Nothing is reconstructed from logs.</p>
+      <p><strong>No archived copy.</strong></p>
+      <p class="muted small">Content is archived for mail submitted through the authenticated submission service after message capture was enabled. Older messages, inbound mail and Postfix-generated notices have no stored content; nothing is reconstructed from logs.</p>
     </div>
   </div>
-  {% else %}
-  <div class="meta-grid">
-    <div class="kv"><span class="k">Subject</span><span class="v" dir="auto">{{ d.content.subject or "—" }}</span></div>
-    <div class="kv"><span class="k">Attachments</span><span class="v">{% for a in d.content.attachments %}<span class="chip">{{ a.filename or "unnamed" }} · {{ a.content_type or "?" }} · {{ (a.size or 0)|human_bytes }}</span>{% else %}none{% endfor %}</span></div>
-  </div>
-  {% if d.content.text_body %}<h3>Plain text</h3><pre class="code body-text" dir="auto">{{ d.content.text_body }}</pre>{% endif %}
-  {% if d.content.html_body %}
-  <h3>HTML preview</h3>
-  <p class="muted small">Rendered in an isolated, script-free sandbox; remote images and other external resources are blocked.</p>
-  <iframe class="html-preview" src="/emails/{{ m.id }}/content-preview" sandbox="" referrerpolicy="no-referrer" loading="lazy" title="HTML preview (sandboxed)"></iframe>
-  {% endif %}
   {% endif %}
 </section>
 {% endblock %}

@@ -39,7 +39,14 @@ after installation; none of them changes the mail stack.
       the URL reproduces the view; sorting by Sent/To/Status works; the row
       menu copies Queue ID and Message-ID; CSV export downloads the filtered rows
 - [ ] **Search index**: `sudo mail-console check` reports "search index complete"
-- [ ] **Content**: details page shows "Content not retained" (no capture is enabled)
+- [ ] **Content (before capture activation)**: details pages say "No archived copy"
+- [ ] **Capture preflight**: `sudo /opt/mail-console/current/deploy/capture-preflight.sh` passes
+- [ ] **Capture (after the approved Postfix change)**: a new BeastPing email shows
+      subject, body (HTML and text), attachments and *Download .eml*; the
+      timeline shows "Copy delivered to the Mail Console archive"; the real
+      recipients and their statuses are unchanged; `sudo mail-console archive verify` passes
+- [ ] **Audit**: the Audit log lists the views and downloads made during acceptance
+- [ ] **2FA** (recommended): enabled for the administrator; sign-in requires a code
 - [ ] **Monitoring**: unit states for Postfix, Mailguard, OpenDKIM, Dovecot are
       correct; queue count matches `postqueue -j | wc -l`
 - [ ] **Restart**: `sudo systemctl restart mail-console-collector mail-console-web`;

@@ -2,18 +2,37 @@
 # Roll back to the previous release.
 #   sudo ./deploy/rollback.sh               # switch code back, keep the database
 #   sudo ./deploy/rollback.sh --restore-db  # also restore the pre-update database backup
+#   --force: roll back to a pre-capture release although Postfix capture is still applied
 # Only the mail-console services are stopped/started.
 set -euo pipefail
 PREFIX=/opt/mail-console
 DATA_DIR=/var/lib/mail-console
+CAPTURE_STATE=/etc/postfix/mailconsole-capture.json
 RESTORE_DB=0
-[ "${1:-}" = "--restore-db" ] && RESTORE_DB=1
+FORCE=0
+for arg in "$@"; do
+  case "$arg" in
+    --restore-db) RESTORE_DB=1 ;;
+    --force) FORCE=1 ;;
+    *) echo "unknown option: $arg" >&2; exit 1 ;;
+  esac
+done
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 
 CURRENT=$(readlink "$PREFIX/current")
 TARGET=$(cat "$PREFIX/previous" 2>/dev/null || true)
 [ -n "$TARGET" ] && [ -d "$PREFIX/$TARGET" ] || { echo "no previous release recorded" >&2; exit 1; }
 echo "==> rolling back: $CURRENT -> $TARGET"
+if [ -x /usr/local/libexec/mail-console/mc-capture ] && [ ! -e "$PREFIX/$TARGET/mailconsole/capture.py" ]; then
+  if [ -e "$CAPTURE_STATE" ] && [ "$FORCE" -eq 0 ]; then
+    echo "refusing: $TARGET predates message capture and Postfix capture is still applied ($CAPTURE_STATE)." >&2
+    echo "          Every archive copy would be deferred and hold its queue file. Deactivate capture first" >&2
+    echo "          (docs/MAIL-CAPTURE.md), or pass --force to accept that. Nothing changed." >&2
+    exit 1
+  fi
+  echo "warning: $TARGET predates message capture. If Postfix capture is active, archive copies will be" >&2
+  echo "         deferred (not lost) until you roll forward or deactivate capture (docs/MAIL-CAPTURE.md)." >&2
+fi
 
 BACKUP="$DATA_DIR/backups/pre-$(basename "$CURRENT").sqlite3"
 if [ "$RESTORE_DB" -eq 1 ] && [ ! -f "$BACKUP" ]; then

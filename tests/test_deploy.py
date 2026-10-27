@@ -46,7 +46,18 @@ def test_no_docker_and_no_mail_service_mutation():
         text = path.read_text()
         assert not mutating.search(text), path
         assert "postsuper" not in text and "postqueue -f" not in text and "postfix reload" not in text, path
-        assert "/etc/postfix" not in text and "/var/spool" not in text, path
+        # The only Postfix path allowed: an existence test of the capture state file (read-only).
+        state_line = "CAPTURE_STATE=/etc/postfix/mailconsole-capture.json\n"
+        if state_line in text:
+            uses = re.findall(r".*\$\{?CAPTURE_STATE\}?.*", text)
+            for use in uses:
+                use = use.strip()
+                existence_test = re.fullmatch(r'if \[ -e "\$CAPTURE_STATE" \](?: && \[ [^]]* \])?; then', use)
+                message = re.fullmatch(r'echo "[^"]*\(\$CAPTURE_STATE\)[^"]*" >&2', use)
+                assert existence_test or message, (path, use)
+            assert uses, path
+            text = text.replace(state_line, "")
+        assert "/etc/postfix" not in text and "/var/spool/postfix" not in text, path
 
 
 def test_python_code_runs_only_read_only_commands():
@@ -113,3 +124,30 @@ def test_example_env_sources_cleanly():
     out = subprocess.run(["bash", "-c", "set -euo pipefail; set -a; . ./.env.example; set +a; echo \"$MC_MONITOR_UNITS\""],
                          cwd=ROOT, capture_output=True, text=True, check=True).stdout
     assert "beastping-mailguard.service" in out and "postfix@-.service" in out
+
+
+def test_capture_preflight_is_read_only():
+    text = (DEPLOY / "capture-preflight.sh").read_text()
+    code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith(("#", "echo")))
+    for forbidden in ("postconf -e", "postconf -M ", "postconf -P ", "postconf -X", "postconf -MX", "postconf -PX",
+                      "postfix reload", "postfix restart", "postfix stop", "systemctl", "> /etc", ">/etc"):
+        assert forbidden not in code.replace('postconf -M submission/inet', '').replace(
+            'postconf -M cleanup-archive/unix', '').replace('postconf -P submission/inet/cleanup_service_name', ''), \
+            forbidden
+    assert "postmap -q" in code and "postmap /" not in code
+
+
+def test_no_script_changes_postfix():
+    for path in SCRIPTS:
+        if path.name == "capture-preflight.sh":
+            continue
+        text = path.read_text()
+        assert "postconf" not in text and "postmap" not in text and "master.cf" not in text, path
+
+
+def test_capture_wrapper_uses_isolated_system_python():
+    text = (DEPLOY / "bin" / "mc-capture").read_text()
+    assert "/usr/bin/python3 -I \"$SCRIPT\"" in text and "SCRIPT=/opt/mail-console/current/mailconsole/capture.py" in text
+    assert "exit 75" in text and "exec " not in text   # every failure must be a temporary failure for pipe(8)
+    for snippet in ("master.cf.snippet",):
+        assert "argv=/usr/local/libexec/mail-console/mc-capture" in (DEPLOY / "postfix" / snippet).read_text()

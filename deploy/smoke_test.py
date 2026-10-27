@@ -58,6 +58,8 @@ def main() -> int:
     p.add_argument("--password-stdin", action="store_true", required=True)
     p.add_argument("--expect", action="append", default=[], help="search term that must return results")
     p.add_argument("--days", type=int, default=400, help="search window ending now (default 400 days)")
+    p.add_argument("--expect-archive", action="append", default=[],
+                   help="search term whose message must have archived content (body, .eml, attachments)")
     args = p.parse_args()
     if not args.url.startswith(("http://", "https://")):
         p.error("--url must be http(s)")
@@ -100,6 +102,35 @@ def main() -> int:
             status, _, page = c.request(detail.group(1))
             check(status == 200 and "Timeline" in page and html_escape(term).lower() in page.lower(),
                   f"detail page for {term!r} shows it with a timeline")
+    for term in args.expect_archive:
+        end = datetime.now(timezone.utc) + timedelta(days=1)
+        window = {"range": "custom", "start": (end - timedelta(days=args.days)).strftime("%Y-%m-%dT%H:%M"),
+                  "end": end.strftime("%Y-%m-%dT%H:%M")}
+        status, _, html = c.request("/emails?" + urllib.parse.urlencode({"q": term, **window}))
+        detail = re.search(r'href="(/emails/\d+)"', html)
+        check(detail is not None, f"archived message for {term!r} is listed")
+        if not detail:
+            continue
+        status, _, page = c.request(detail.group(1))
+        archive_id = re.search(r'href="/archives/(\d+)/raw\.eml"', page)
+        check(status == 200 and archive_id is not None and html_escape(term).lower() in page.lower(),
+              f"details page shows the archived content for {term!r}")
+        check("Copy delivered to the Mail Console archive" in page, "archive copy appears in the timeline only")
+        if archive_id:
+            aid = archive_id.group(1)
+            status, headers, raw = c.request(f"/archives/{aid}/raw.eml")
+            check(status == 200 and "Subject:" in raw and "attachment" in headers.get("Content-Disposition", ""),
+                  "original .eml downloads")
+            status, headers, preview = c.request(f"/archives/{aid}/preview.html")
+            if status == 200:
+                check(headers.get("Content-Security-Policy", "").startswith("sandbox"), "HTML preview is sandboxed")
+            else:
+                check(status == 404 and "has no HTML part" in preview, "plain-text message has no HTML preview")
+            part = re.search(rf'href="(/archives/{aid}/parts/\d+)"', page)
+            if part:
+                status, headers, _ = c.request(part.group(1))
+                check(status == 200 and headers.get("Content-Type", "").startswith("application/octet-stream"),
+                      "attachment downloads as a file")
     status, headers, body = c.request("/emails/export.csv?range=90d")
     check(status == 200 and headers.get("Content-Type", "").startswith("text/csv") and body.startswith("\ufeffsent_at_utc"),
           "CSV export works")

@@ -26,6 +26,7 @@ log = logging.getLogger("mailconsole.collector")
 HEARTBEAT_SECONDS = 15.0
 MAINTENANCE_SECONDS = 3600.0
 QUEUE_SNAPSHOT_RETENTION_DAYS = 14
+AUDIT_RETENTION_DAYS = 730
 DELETE_CHUNK = 500
 
 
@@ -71,7 +72,7 @@ def classify_lines(cfg: Config, lines: Iterable[tuple[str, datetime]]) -> list[C
         record = parse_syslog_line(line, bsd_tz=cfg.log_timezone, reference=ref)
         if record is None:
             continue
-        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs)
+        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs, cfg.archive_recipient)
         if item is not None:
             out.append(item)
     return out
@@ -80,7 +81,7 @@ def classify_lines(cfg: Config, lines: Iterable[tuple[str, datetime]]) -> list[C
 def classify_records(cfg: Config, records: Iterable[LogRecord]) -> list[Classified]:
     out = []
     for record in records:
-        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs)
+        item = classify(record, cfg.postfix_prefixes, cfg.ops_programs, cfg.archive_recipient)
         if item is not None:
             out.append(item)
     return out
@@ -187,21 +188,42 @@ def apply_retention(conn: sqlite3.Connection, cfg: Config, *, now: int | None = 
         conn.execute("DELETE FROM login_attempts WHERE success = 0 AND ts < ?", (now - 7 * 86400 * 1_000_000,))
         conn.execute("DELETE FROM login_attempts WHERE ts < ?", (now - 31 * 86400 * 1_000_000,))
 
+    with tx(conn):
+        conn.execute("DELETE FROM audit_log WHERE ts < ?", (now - AUDIT_RETENTION_DAYS * 86400 * 1_000_000,))
+
     cap = cfg.max_db_mb * 1024 * 1024
-    trimmed = 0
+    trimmed = unindexed = 0
+    floor = now - 86400 * 1_000_000   # the last day of history is never trimmed by the size cap
     while live_db_bytes(conn) > cap:
+        # 1. The full-text index of archived content is the cheapest thing to give
+        #    up: the archived messages themselves stay viewable and downloadable.
+        with tx(conn):
+            ids = [r[0] for r in conn.execute(
+                "SELECT s.rowid FROM archive_search s JOIN archives a ON a.id = s.rowid"
+                " ORDER BY a.captured_ts LIMIT 2000")]
+            if ids:
+                conn.execute(f"DELETE FROM archive_search WHERE rowid IN ({','.join('?' * len(ids))})", ids)
+        if ids:
+            unindexed += len(ids)
+            conn.execute("PRAGMA incremental_vacuum")
+            continue
+        # 2. Then the oldest log history, ~5% of the retained span per round.
         oldest = conn.execute("SELECT min(last_ts), max(last_ts) FROM messages").fetchone()
-        if oldest[0] is None:
+        if oldest[0] is None or oldest[0] >= floor:
+            with tx(conn):
+                note(conn, f"database is over MC_MAX_DB_MB={cfg.max_db_mb} with only the last day of history left; "
+                     "raise MC_MAX_DB_MB", "error")
             break
-        # Drop the oldest ~5% of the retained time span per round.
         step = max((oldest[1] - oldest[0]) // 20, 1_000_000)
-        trimmed += _delete_messages_before(conn, oldest[0] + step)
+        trimmed += _delete_messages_before(conn, min(oldest[0] + step, floor))
         with tx(conn):
-            conn.execute("DELETE FROM ops_events WHERE ts < ?", (oldest[0] + step,))
-    if trimmed:
+            conn.execute("DELETE FROM ops_events WHERE ts < ?", (min(oldest[0] + step, floor),))
+    if trimmed or unindexed:
         with tx(conn):
-            note(conn, f"database size cap MC_MAX_DB_MB={cfg.max_db_mb} reached; removed {trimmed} oldest messages")
+            note(conn, f"database size cap MC_MAX_DB_MB={cfg.max_db_mb} reached; removed {trimmed} oldest messages and "
+                 f"the search index of {unindexed} oldest archived messages")
     result["size_cap_trimmed"] = trimmed
+    result["size_cap_unindexed"] = unindexed
     conn.execute("PRAGMA incremental_vacuum")
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     with tx(conn):
@@ -241,6 +263,16 @@ class Collector:
         self.cfg = cfg
         self.stop = stop or threading.Event()
         self.enable_monitor = enable_monitor
+        self.touched_queue_ids: set[str] = set()
+        self.archive_store = None
+        self._archive_note_at = 0.0
+        self._archive_blocked: str | None = None
+        if cfg.archive_enabled:
+            from .archive import open_store
+            try:
+                self.archive_store = open_store(cfg)
+            except (OSError, ValueError) as exc:
+                log.error("message archive disabled: cannot load MC_ARCHIVE_KEY_FILE: %s", exc)
         if cfg.log_source == "journald":
             self.source = JournaldSource(cfg.journalctl_cmd, cfg.journal_units)
         else:
@@ -253,7 +285,8 @@ class Collector:
         if batch.lines or batch.records or batch.notes or (batch.checkpoint and batch.checkpoint != cp):
             items = classify_lines(self.cfg, batch.lines) + classify_records(self.cfg, batch.records)
             with tx(conn):
-                ingest_batch(conn, self.cfg, ingestor, items)
+                stats = ingest_batch(conn, self.cfg, ingestor, items)
+                self.touched_queue_ids |= stats.queue_ids
                 _bump(conn, "lines_total", len(batch.lines) + len(batch.records))
                 for text in batch.notes:
                     log.warning(text)
@@ -262,6 +295,28 @@ class Collector:
                     save_checkpoint(conn, self.source.name, batch.checkpoint)
                 set_state(conn, "last_batch_ts", str(now_us()))
         return batch.more
+
+    def archive_step(self, conn: sqlite3.Connection) -> bool:
+        """Ingest captured message copies and (re)link archives. Returns True if more are waiting."""
+        if self.archive_store is None:
+            return False
+        from . import archive
+        stats = archive.process_spool(conn, self.cfg, self.archive_store)
+        touched, self.touched_queue_ids = self.touched_queue_ids | stats.queue_ids, set()
+        archive.relink(conn, touched)
+        now = time.monotonic()
+        problems = ([stats.blocked] if stats.blocked else []) + stats.errors
+        if stats.blocked != self._archive_blocked:
+            with tx(conn):
+                set_state(conn, "archive_blocked", stats.blocked or "")
+            self._archive_blocked = stats.blocked
+        if problems and now - self._archive_note_at > 3600:
+            with tx(conn):
+                for text in problems[:5]:
+                    log.error("message archive: %s", text)
+                    note(conn, f"message archive: {text}", "error")
+            self._archive_note_at = now
+        return stats.ingested + stats.duplicates >= archive.SPOOL_BATCH
 
     def run(self) -> None:
         cfg = self.cfg
@@ -282,6 +337,7 @@ class Collector:
                 more = False
                 try:
                     more = self.step(conn, ingestor)
+                    more = self.archive_step(conn) or more
                     now = time.monotonic()
                     if now >= next_heartbeat:
                         with tx(conn):
@@ -292,6 +348,14 @@ class Collector:
                         next_monitor = now + cfg.monitor_interval
                     if now >= next_maintenance:
                         result = apply_retention(conn, cfg)
+                        if self.archive_store is not None:
+                            from . import archive
+                            spool_notes = archive.cleanup_spool(cfg)
+                            result["archive"] = archive.apply_retention(conn, cfg, self.archive_store)
+                            if spool_notes:
+                                with tx(conn):
+                                    for text in spool_notes[:20]:
+                                        note(conn, f"message archive: {text}", "info")
                         log.info("maintenance: %s", result)
                         next_maintenance = now + MAINTENANCE_SECONDS
                 except sqlite3.OperationalError as exc:
