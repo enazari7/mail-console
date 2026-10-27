@@ -130,8 +130,11 @@ def test_unrecoverable_replacement_is_reported(db, cfg):
     os.unlink(log)                   # replaced, old file gone
     write(log, lines[22:], "w")
     drain(collector, db)
-    notes = " ".join(r[0] for r in db.execute("SELECT message FROM ops_events WHERE program = 'mail-console'"))
-    assert "rewritten in place" in notes and "previous file was not found" in notes
+    notes = [r[0] for r in db.execute("SELECT message FROM ops_events WHERE program = 'mail-console' ORDER BY id")]
+    # Both events are reported as possible gaps. (Which wording is used for the
+    # second one depends on whether the file system hands out the same inode again.)
+    assert len([n for n in notes if "may be missing" in n]) == 2
+    assert "rewritten in place" in notes[0]
 
 
 def test_inode_reuse_detected_by_fingerprint(tmp_path):
