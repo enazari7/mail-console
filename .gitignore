@@ -1,0 +1,29 @@
+# Never commit runtime data or real configuration.
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+.env
+*.env
+!.env.example
+data/
+backups/
+*.log
+!tests/fixtures/*.log
+*.gz
+*.pem
+*.key
+*.crt
+
+# Python / tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
