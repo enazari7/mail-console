@@ -1,0 +1,8 @@
+smtp       inet  n       -       y       -       -       smtpd
+91.107.182.219:submission inet n       -       y       -       -       smtpd -o syslog_name=postfix/submission -o smtpd_tls_security_level=encrypt -o smtpd_sasl_auth_enable=yes -o smtpd_tls_auth_only=yes -o smtpd_client_restrictions=permit_sasl_authenticated,reject -o smtpd_sender_login_maps=hash:/etc/postfix/sender_login -o smtpd_sender_restrictions=reject_sender_login_mismatch -o smtpd_milters=inet:127.0.0.1:8892,inet:127.0.0.1:8891 -o milter_macro_daemon_name=ORIGINATING
+127.0.0.1:submission inet n       -       y       -       -       smtpd -o syslog_name=postfix/submission-local -o smtpd_tls_security_level=encrypt -o smtpd_sasl_auth_enable=yes -o smtpd_client_restrictions=permit_sasl_authenticated,reject -o smtpd_milters=inet:127.0.0.1:8892,inet:127.0.0.1:8891 -o milter_macro_daemon_name=ORIGINATING
+pickup     unix  n       -       y       60      1       pickup
+cleanup    unix  n       -       y       -       0       cleanup
+qmgr       unix  n       -       n       300     1       qmgr
+smtp       unix  -       -       y       -       -       smtp
+bouncecoll unix  -       n       n       -       2       pipe user=bounce argv=/opt/bounce/collector.py ${sender} ${recipient}

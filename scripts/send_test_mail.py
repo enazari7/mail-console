@@ -41,11 +41,27 @@ def main() -> int:
     p.add_argument("--port", type=int, default=25)
     p.add_argument("--to", action="append", required=True)
     p.add_argument("--only-plain", action="store_true")
+    p.add_argument("--starttls", action="store_true")
+    p.add_argument("--user")
+    p.add_argument("--password")
+    p.add_argument("--tag", default="", help="appended to the plain message subject")
     args = p.parse_args()
     with smtplib.SMTP(args.host, args.port, timeout=30) as s:
+        if args.starttls:
+            import ssl
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE   # CI uses a self-signed certificate
+            s.starttls(context=ctx)
+        if args.user:
+            s.login(args.user, args.password or "")
         if not args.only_plain:
             s.send_message(rich(args.to), from_addr="notify@example.com", to_addrs=args.to)
-        s.send_message(plain(args.to), from_addr="notify@example.com", to_addrs=args.to)
+        msg = plain(args.to)
+        if args.tag:
+            del msg["Subject"]
+            msg["Subject"] = f"Plain text PLAIN-CI {args.tag}"
+        s.send_message(msg, from_addr="notify@example.com", to_addrs=args.to)
     print("sent")
     return 0
 

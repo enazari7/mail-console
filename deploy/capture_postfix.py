@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""Plan, apply and reverse the Mail Console capture change in Postfix.
+
+Operator tool (run as root, standard library only). Mail Console's install,
+update, rollback and uninstall scripts never call it.
+
+    sudo python3 -I capture_postfix.py plan                 # read-only
+    sudo python3 -I capture_postfix.py apply [--listener NAME] [--yes]
+    sudo postfix reload                                     # activates
+    sudo python3 -I capture_postfix.py deactivate          # exact restore
+    sudo postfix reload
+    sudo python3 -I capture_postfix.py status
+
+What ``apply`` changes, and nothing else:
+
+* adds the service ``cleanup-archive`` as an exact copy of the cleanup
+  service the listener uses today (same private/unpriv/chroot/wakeup/maxproc
+  columns and -o options) plus ``always_bcc=archive@mail-console.invalid``;
+* adds the pipe service ``mailconsole-archive``;
+* writes /etc/postfix/mailconsole_transport and *prepends* it to the
+  existing ``transport_maps`` (other maps and their order are kept);
+* sets ``mailconsole-archive_destination_recipient_limit = 1``;
+* sets ``cleanup_service_name=cleanup-archive`` on the selected listener(s)
+  only, leaving every other listener option untouched.
+
+The previous values are recorded in a state file before anything changes, so
+``deactivate`` restores them exactly.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+
+ARCHIVE_ADDRESS = "archive@mail-console.invalid"
+ARCHIVE_SERVICE = "cleanup-archive"
+PIPE_SERVICE = "mailconsole-archive"
+CAPTURE_ENTRY = "/usr/local/libexec/mail-console/mc-capture"
+PIPE_LINE = (f"{PIPE_SERVICE} unix - n n - 4 pipe user=mcarchive argv={CAPTURE_ENTRY} "
+             "--queue-id=${queue_id} --sender=${sender} --sasl-user=${sasl_username}")
+MAP_FILE = "/etc/postfix/mailconsole_transport"
+MAP_REF = f"hash:{MAP_FILE}"
+MAP_CONTENT = (
+    "# Mail Console archive copy -> internal pipe transport only. The .invalid TLD never resolves.\n"
+    f"{ARCHIVE_ADDRESS}    {PIPE_SERVICE}:\n"
+)
+LIMIT_PARAM = f"{PIPE_SERVICE}_destination_recipient_limit"
+STATE_FILE = "/etc/postfix/mailconsole-capture.json"
+BACKUP_ROOT = "/var/backups/mail-console-postfix"
+SUBMISSION_PORTS = {"submission", "587", "submissions", "smtps", "465"}
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
+
+
+class PlanError(Exception):
+    """The listener to configure cannot be identified safely."""
+
+
+@dataclass
+class Service:
+    name: str
+    type: str
+    fields: list[str]                 # private unpriv chroot wakeup maxproc
+    command: str
+    line: str                         # full master.cf entry as printed by postconf -M
+    params: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def host(self) -> str | None:
+        if ":" not in self.name:
+            return None
+        return self.name.rsplit(":", 1)[0]
+
+    @property
+    def port(self) -> str:
+        return self.name.rsplit(":", 1)[-1]
+
+    @property
+    def is_loopback(self) -> bool:
+        return (self.host or "").lower() in LOOPBACK_HOSTS
+
+
+# --- Postfix access (real and, in tests, fake) ----------------------------------
+
+class Postfix:
+    """Thin wrapper around postconf/postmap/postfix; every change goes through here."""
+
+    def __init__(self, postconf="/usr/sbin/postconf", postmap="/usr/sbin/postmap", postfix="/usr/sbin/postfix",
+                 config_dir="/etc/postfix"):
+        self.postconf, self.postmap, self.postfix_cmd, self.config_dir = postconf, postmap, postfix, config_dir
+
+    def _run(self, *args: str, check: bool = True) -> str:
+        proc = subprocess.run(list(args), capture_output=True, text=True, timeout=60)
+        if check and proc.returncode != 0:
+            raise RuntimeError(f"{' '.join(args)}: {proc.stderr.strip() or proc.returncode}")
+        return proc.stdout
+
+    # read
+    def master_lines(self) -> str:
+        return self._run(self.postconf, "-M")
+
+    def service_params(self) -> str:
+        return self._run(self.postconf, "-P")
+
+    def main_value(self, name: str) -> str:
+        return self._run(self.postconf, "-h", name).strip()
+
+    def main_explicit(self) -> str:
+        return self._run(self.postconf, "-n")
+
+    def query(self, table: str, key: str) -> str | None:
+        proc = subprocess.run([self.postmap, "-q", key, table], capture_output=True, text=True, timeout=30)
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    # write
+    def set_main(self, name: str, value: str) -> None:
+        self._run(self.postconf, "-e", f"{name}={value}")
+
+    def remove_main(self, name: str) -> None:
+        self._run(self.postconf, "-X", name)
+
+    def set_service(self, name: str, type_: str, line: str) -> None:
+        self._run(self.postconf, "-M", f"{name}/{type_}={line}")
+
+    def remove_service(self, name: str, type_: str) -> None:
+        self._run(self.postconf, "-MX", f"{name}/{type_}")
+
+    def set_service_param(self, name: str, type_: str, param: str, value: str) -> None:
+        self._run(self.postconf, "-P", f"{name}/{type_}/{param}={value}")
+
+    def remove_service_param(self, name: str, type_: str, param: str) -> None:
+        self._run(self.postconf, "-PX", f"{name}/{type_}/{param}")
+
+    def write_map(self, content: str) -> None:
+        with open(MAP_FILE, "w") as fh:
+            fh.write(content)
+        os.chmod(MAP_FILE, 0o644)
+        self._run(self.postmap, MAP_REF)
+
+    def remove_map(self) -> None:
+        for path in (MAP_FILE, MAP_FILE + ".db", MAP_FILE + ".lmdb"):
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def check(self) -> None:
+        self._run(self.postfix_cmd, "check")
+
+    def backup(self, directory: str) -> None:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        for name in ("main.cf", "master.cf"):
+            shutil.copy2(os.path.join(self.config_dir, name), os.path.join(directory, name))
+
+
+# --- parsing and planning ----------------------------------------------------------
+
+def parse_services(master_text: str, params_text: str) -> dict[tuple[str, str], Service]:
+    services: dict[tuple[str, str], Service] = {}
+    for raw in master_text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        svc = Service(name=parts[0], type=parts[1], fields=parts[2:7], command=parts[7], line=line)
+        services[(svc.name, svc.type)] = svc
+    for raw in params_text.splitlines():
+        key, sep, value = raw.partition("=")
+        if not sep:
+            continue
+        path = key.strip()
+        # service names may contain ':' and '[', never '/'
+        bits = path.split("/")
+        if len(bits) != 3:
+            continue
+        svc = services.get((bits[0], bits[1]))
+        if svc is not None:
+            svc.params[bits[2]] = value.strip()
+    return services
+
+
+def smtpd_listeners(services: dict) -> list[Service]:
+    return [s for s in services.values() if s.type == "inet" and s.command == "smtpd"]
+
+
+def is_authenticated(svc: Service, global_sasl: str) -> bool:
+    return svc.params.get("smtpd_sasl_auth_enable", global_sasl).strip().lower() == "yes"
+
+
+def choose_listeners(services: dict, global_sasl: str, requested: list[str]) -> list[Service]:
+    listeners = smtpd_listeners(services)
+    by_name = {s.name: s for s in listeners}
+    if requested:
+        chosen = []
+        for name in requested:
+            svc = by_name.get(name)
+            if svc is None:
+                raise PlanError(f"--listener {name}: no smtpd inet service with that name "
+                                f"(found: {', '.join(sorted(by_name)) or 'none'})")
+            if not is_authenticated(svc, global_sasl):
+                raise PlanError(f"--listener {name} does not require SMTP AUTH; capturing it could archive "
+                                "unrelated inbound mail. Refusing.")
+            chosen.append(svc)
+        return chosen
+    candidates = [s for s in listeners
+                  if s.port in SUBMISSION_PORTS and not s.is_loopback and is_authenticated(s, global_sasl)]
+    if not candidates:
+        raise PlanError("no public authenticated submission listener found among: "
+                        + (", ".join(f"{s.name}/inet" for s in listeners) or "none")
+                        + ". Pass --listener NAME explicitly after checking master.cf.")
+    if len(candidates) > 1:
+        raise PlanError("more than one public authenticated submission listener: "
+                        + ", ".join(f"{s.name}/inet" for s in candidates)
+                        + ". Choose explicitly with --listener NAME (repeat for several).")
+    return candidates
+
+
+def base_cleanup(services: dict, listeners: list[Service]) -> Service:
+    """The cleanup service the listeners use today (cleanup-archive copies it)."""
+    names = {s.params.get("cleanup_service_name", "cleanup") for s in listeners}
+    if len(names) != 1:
+        raise PlanError(f"the selected listeners use different cleanup services ({', '.join(sorted(names))}); "
+                        "configure them one at a time")
+    name = names.pop()
+    if name == ARCHIVE_SERVICE:
+        raise PlanError("the selected listener already uses cleanup-archive (capture is already active)")
+    base = services.get((name, "unix"))
+    if base is None:
+        raise PlanError(f"cleanup service {name}/unix not found in master.cf")
+    return base
+
+
+def archive_cleanup_line(base: Service) -> str:
+    """The base cleanup entry with only its name changed (columns and -o options kept)."""
+    rest = base.line.split(None, 1)[1]
+    return f"{ARCHIVE_SERVICE} {rest}"
+
+
+def new_transport_maps(current: str) -> str:
+    entries = [e for e in re.split(r"[\s,]+", current.strip()) if e]
+    if MAP_REF in entries:
+        return current.strip()
+    return MAP_REF if not entries else f"{MAP_REF}, {current.strip()}"
+
+
+@dataclass
+class Plan:
+    listeners: list[Service]
+    base: Service
+    cleanup_line: str
+    transport_maps_before: str
+    transport_maps_after: str
+    services: dict
+
+    def commands(self) -> list[str]:
+        cmds = [
+            f"install -m 0644 <map> {MAP_FILE}   # {ARCHIVE_ADDRESS} -> {PIPE_SERVICE}:",
+            f"postmap {MAP_REF}",
+            f"postconf -e 'transport_maps={self.transport_maps_after}'",
+            f"postconf -e '{LIMIT_PARAM}=1'",
+            f"postconf -M '{ARCHIVE_SERVICE}/unix={self.cleanup_line}'",
+            f"postconf -P '{ARCHIVE_SERVICE}/unix/always_bcc={ARCHIVE_ADDRESS}'",
+            f"postconf -M '{PIPE_SERVICE}/unix={PIPE_LINE}'",
+        ]
+        cmds += [f"postconf -P '{s.name}/inet/cleanup_service_name={ARCHIVE_SERVICE}'" for s in self.listeners]
+        cmds += ["postfix check", "postfix reload   # run by the operator after reviewing"]
+        return cmds
+
+
+def make_plan(pf, requested: list[str]) -> Plan:
+    services = parse_services(pf.master_lines(), pf.service_params())
+    for name in (ARCHIVE_SERVICE, PIPE_SERVICE):
+        if (name, "unix") in services:
+            raise PlanError(f"{name}/unix already exists in master.cf; run 'status' or 'deactivate' first")
+    listeners = choose_listeners(services, pf.main_value("smtpd_sasl_auth_enable"), requested)
+    base = base_cleanup(services, listeners)
+    current_maps = pf.main_value("transport_maps")
+    return Plan(listeners, base, archive_cleanup_line(base), current_maps, new_transport_maps(current_maps), services)
+
+
+def describe(pf, plan: Plan, out=sys.stdout) -> None:
+    print("smtpd listeners found:", file=out)
+    for s in smtpd_listeners(plan.services):
+        auth = "AUTH" if is_authenticated(s, pf.main_value("smtpd_sasl_auth_enable")) else "no AUTH"
+        mark = "  <- capture" if s in plan.listeners else ("  (loopback: not captured)" if s.is_loopback else "")
+        print(f"  {s.name}/inet [{auth}] cleanup={s.params.get('cleanup_service_name', 'cleanup')}{mark}", file=out)
+    print(f"base cleanup: {plan.base.name}/unix columns={' '.join(plan.base.fields)}", file=out)
+    print(f"transport_maps: {plan.transport_maps_before or '(empty)'}", file=out)
+    print(f"            ->  {plan.transport_maps_after}", file=out)
+    print("commands:", file=out)
+    for cmd in plan.commands():
+        print(f"  {cmd}", file=out)
+
+
+# --- apply / verify / deactivate -------------------------------------------------------
+
+def verify(pf, state: dict) -> list[str]:
+    """Return problems; empty means the live configuration matches the plan."""
+    problems = []
+    services = parse_services(pf.master_lines(), pf.service_params())
+    for name, before in state["listeners"].items():
+        svc = services.get((name, "inet"))
+        if svc is None:
+            problems.append(f"{name}/inet disappeared")
+            continue
+        if svc.params.get("cleanup_service_name") != ARCHIVE_SERVICE:
+            problems.append(f"{name}/inet does not use {ARCHIVE_SERVICE}")
+        expected = dict(before["params"])
+        expected["cleanup_service_name"] = ARCHIVE_SERVICE
+        if svc.params != expected:
+            problems.append(f"{name}/inet options changed beyond cleanup_service_name")
+    for (name, type_), svc in services.items():
+        if type_ == "inet" and name not in state["listeners"] and svc.params.get("cleanup_service_name") == ARCHIVE_SERVICE:
+            problems.append(f"{name}/inet uses {ARCHIVE_SERVICE} but was not selected")
+    archive = services.get((ARCHIVE_SERVICE, "unix"))
+    if archive is None or archive.fields != state["base_fields"]:
+        problems.append(f"{ARCHIVE_SERVICE}/unix missing or its columns differ from {state['base']}/unix")
+    elif archive.params.get("always_bcc") != ARCHIVE_ADDRESS:
+        problems.append(f"{ARCHIVE_SERVICE}/unix lacks always_bcc={ARCHIVE_ADDRESS}")
+    if (PIPE_SERVICE, "unix") not in services:
+        problems.append(f"{PIPE_SERVICE}/unix missing")
+    # The archive address must resolve to the internal pipe transport, first.
+    maps = [m for m in re.split(r"[\s,]+", pf.main_value("transport_maps")) if m]
+    first_hit = None
+    for table in maps:
+        hit = pf.query(table, ARCHIVE_ADDRESS)
+        if hit is not None:
+            first_hit = (table, hit)
+            break
+    if first_hit is None or first_hit[1].strip() != f"{PIPE_SERVICE}:":
+        problems.append(f"{ARCHIVE_ADDRESS} does not resolve to {PIPE_SERVICE}: first (got {first_hit})")
+    for param in ("virtual_alias_maps", "canonical_maps", "recipient_canonical_maps"):
+        for table in [m for m in re.split(r"[\s,]+", pf.main_value(param)) if m and ":" in m]:
+            if pf.query(table, ARCHIVE_ADDRESS) is not None:
+                problems.append(f"{param} {table} rewrites {ARCHIVE_ADDRESS}")
+    domains = " ".join(pf.main_value(p) for p in ("mydestination", "virtual_mailbox_domains", "virtual_alias_domains",
+                                                   "relay_domains"))
+    if "mail-console.invalid" in domains:
+        problems.append("mail-console.invalid is listed as a local/virtual/relay domain")
+    return problems
+
+
+def snapshot(pf) -> dict:
+    return {"main": pf.main_explicit(), "master": pf.master_lines(), "params": pf.service_params()}
+
+
+def apply(pf, plan: Plan, state_file: str = STATE_FILE, backup_root: str = BACKUP_ROOT, now: str | None = None) -> dict:
+    if os.path.exists(state_file):
+        raise PlanError(f"{state_file} exists: capture is already applied (run deactivate first)")
+    stamp = now or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_dir = os.path.join(backup_root, stamp)
+    pf.backup(backup_dir)
+    state = {
+        "version": 1, "applied": stamp, "backup_dir": backup_dir,
+        "listeners": {s.name: {"cleanup_service_name": s.params.get("cleanup_service_name"),
+                               "params": dict(s.params)} for s in plan.listeners},
+        "base": plan.base.name, "base_fields": plan.base.fields,
+        "transport_maps": plan.transport_maps_before or None,
+        "transport_maps_explicit": "transport_maps" in _explicit_names(pf.main_explicit()),
+        "limit_explicit": LIMIT_PARAM in _explicit_names(pf.main_explicit()),
+        "limit": pf.main_value(LIMIT_PARAM) if LIMIT_PARAM in _explicit_names(pf.main_explicit()) else None,
+        "map_existed": os.path.exists(MAP_FILE),
+        "before": snapshot(pf),
+    }
+    _write_state(state_file, state)
+    try:
+        pf.write_map(MAP_CONTENT)
+        pf.set_main("transport_maps", plan.transport_maps_after)
+        pf.set_main(LIMIT_PARAM, "1")
+        pf.set_service(ARCHIVE_SERVICE, "unix", plan.cleanup_line)
+        pf.set_service_param(ARCHIVE_SERVICE, "unix", "always_bcc", ARCHIVE_ADDRESS)
+        pf.set_service(PIPE_SERVICE, "unix", PIPE_LINE)
+        for svc in plan.listeners:
+            pf.set_service_param(svc.name, "inet", "cleanup_service_name", ARCHIVE_SERVICE)
+        pf.check()
+        problems = verify(pf, state)
+        if problems:
+            raise PlanError("verification failed: " + "; ".join(problems))
+    except Exception:
+        deactivate(pf, state_file=state_file, remove_all=True)
+        raise
+    return state
+
+
+def _explicit_names(main_n: str) -> set[str]:
+    return {line.split("=", 1)[0].strip() for line in main_n.splitlines() if "=" in line}
+
+
+def _write_state(path: str, state: dict) -> None:
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump(state, fh, indent=2)
+    os.replace(tmp, path)
+
+
+def deactivate(pf, state_file: str = STATE_FILE, remove_all: bool = True) -> dict:
+    """Restore everything apply changed to its exact previous value."""
+    with open(state_file) as fh:
+        state = json.load(fh)
+    for name, before in state["listeners"].items():
+        previous = before["cleanup_service_name"]
+        if previous is None:
+            try:
+                pf.remove_service_param(name, "inet", "cleanup_service_name")
+            except RuntimeError:
+                pass   # never set (apply failed early)
+        else:
+            pf.set_service_param(name, "inet", "cleanup_service_name", previous)
+    if remove_all:
+        for name in (PIPE_SERVICE, ARCHIVE_SERVICE):
+            try:
+                pf.remove_service(name, "unix")
+            except RuntimeError:
+                pass
+        if state["transport_maps_explicit"]:
+            pf.set_main("transport_maps", state["transport_maps"] or "")
+        else:
+            try:
+                pf.remove_main("transport_maps")
+            except RuntimeError:
+                pass
+        if state["limit_explicit"]:
+            pf.set_main(LIMIT_PARAM, state["limit"])
+        else:
+            try:
+                pf.remove_main(LIMIT_PARAM)
+            except RuntimeError:
+                pass
+        if not state["map_existed"]:
+            pf.remove_map()
+    pf.check()
+    services = parse_services(pf.master_lines(), pf.service_params())
+    for name, before in state["listeners"].items():
+        svc = services.get((name, "inet"))
+        if svc is not None and svc.params != before["params"]:
+            raise RuntimeError(f"{name}/inet options were not restored exactly: {svc.params} != {before['params']}")
+    if remove_all:
+        os.replace(state_file, state_file + f".deactivated-{state['applied']}")
+    return state
+
+
+def main(argv: list[str] | None = None, pf=None) -> int:
+    p = argparse.ArgumentParser(prog="capture_postfix.py", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    plan_p = sub.add_parser("plan", help="show what apply would change (read-only)")
+    plan_p.add_argument("--listener", action="append", default=[])
+    apply_p = sub.add_parser("apply", help="apply the capture change (does not reload Postfix)")
+    apply_p.add_argument("--listener", action="append", default=[])
+    apply_p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    sub.add_parser("deactivate", help="restore every changed setting to its exact previous value")
+    sub.add_parser("status", help="show the recorded state")
+    args = p.parse_args(argv)
+    pf = pf or Postfix()
+    try:
+        if args.cmd == "plan":
+            describe(pf, make_plan(pf, args.listener))
+            return 0
+        if args.cmd == "status":
+            if not os.path.exists(STATE_FILE):
+                print("capture is not applied (no state file)")
+                return 0
+            with open(STATE_FILE) as fh:
+                state = json.load(fh)
+            print(f"applied {state['applied']} to: {', '.join(n + '/inet' for n in state['listeners'])}")
+            problems = verify(pf, state)
+            print("verification: " + ("ok" if not problems else "; ".join(problems)))
+            return 0 if not problems else 1
+        if os.geteuid() != 0:
+            print("run as root", file=sys.stderr)
+            return 1
+        if args.cmd == "apply":
+            plan = make_plan(pf, args.listener)
+            describe(pf, plan)
+            if not args.yes and input("Apply these changes? Type 'yes': ").strip() != "yes":
+                print("aborted; nothing changed")
+                return 1
+            state = apply(pf, plan)
+            print(f"applied and verified; backups in {state['backup_dir']}; state in {STATE_FILE}")
+            print("Activate with:  postfix reload")
+            return 0
+        if args.cmd == "deactivate":
+            deactivate(pf)
+            print("previous listener overrides, transport_maps and services restored")
+            print("Activate with:  postfix reload")
+            return 0
+    except PlanError as exc:
+        print(f"refusing: {exc}", file=sys.stderr)
+        return 2
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

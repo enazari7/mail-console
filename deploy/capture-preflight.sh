@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Read-only checks before activating Mail Console message capture in Postfix.
 # Changes nothing in Postfix; prints what it found and the exact proposal.
-#   sudo ./deploy/capture-preflight.sh
+#   sudo ./deploy/capture-preflight.sh [--listener NAME ...]
 set -uo pipefail
 ARCHIVE=archive@mail-console.invalid
 SPOOL=/var/spool/mail-console/incoming
@@ -37,27 +37,24 @@ fi
 rm -rf "$TMP"
 
 echo "--- current Postfix settings (read-only) ---"
-SUBMISSION=$(postconf -M submission/inet 2>/dev/null)
-if [ -n "$SUBMISSION" ]; then
-  ok "submission service present: $(echo "$SUBMISSION" | tr -s ' ' | cut -c1-120)"
-else
-  warn "no 'submission' service in master.cf; adapt the proposal to the service BeastPing uses"
-fi
-[ -n "$(postconf -M cleanup-archive/unix 2>/dev/null)" ] && warn "cleanup-archive already defined" || ok "cleanup-archive not defined yet"
-postconf -P submission/inet/cleanup_service_name 2>/dev/null | grep -q . \
-  && warn "submission already overrides cleanup_service_name: $(postconf -P submission/inet/cleanup_service_name)" \
-  || ok "submission uses the default cleanup service"
 for p in always_bcc sender_bcc_maps recipient_bcc_maps transport_maps virtual_alias_maps canonical_maps \
-         recipient_canonical_maps smtpd_milters non_smtpd_milters message_size_limit maximal_queue_lifetime; do
+         recipient_canonical_maps smtpd_milters message_size_limit queue_minfree maximal_queue_lifetime; do
   printf '      %-26s = %s\n' "$p" "$(postconf -h "$p")"
 done
 for map in $(postconf -h virtual_alias_maps recipient_canonical_maps canonical_maps | tr ', ' '\n\n' | grep ':'); do
-  if postmap -q "$ARCHIVE" "$map" >/dev/null 2>&1; then warn "$map rewrites $ARCHIVE; capture would not work"; fi
+  if postmap -q "$ARCHIVE" "$map" >/dev/null 2>&1; then fail "$map rewrites $ARCHIVE; capture would not work"; fi
 done
 [ -n "$(postconf -h always_bcc)" ] && warn "global always_bcc is set; review interaction"
 
-echo "--- proposal (not applied) ---"
-echo "see deploy/postfix/*.snippet and docs/MAIL-CAPTURE.md"
+echo "--- listener selection and exact plan (read-only) ---"
+HERE=$(cd "$(dirname "$0")" && pwd)
+if /usr/bin/python3 -I "$HERE/capture_postfix.py" plan "$@"; then
+  ok "a single listener was identified safely (shown above)"
+else
+  fail "the listener to capture could not be identified safely; read the message above and pass --listener NAME"
+fi
+
+echo "--- nothing was changed. Apply only after review: capture_postfix.py apply (docs/MAIL-CAPTURE.md) ---"
 [ "$FAIL" -eq 0 ] || exit 1
 [ "$WARN" -eq 0 ] || exit 2
 exit 0
